@@ -1,0 +1,107 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+
+  "_comment_overview": [
+    "RENOVATE: Alternativa más potente a Dependabot.",
+    "Para activarlo: instalar la GitHub App de Renovate en https://github.com/apps/renovate",
+    "o usar self-hosted con un PAT en secrets.RENOVATE_TOKEN.",
+    "Este archivo va en la RAÍZ del repositorio (no en .github/).",
+    "Documentación: https://docs.renovatebot.com/configuration-options/"
+  ],
+
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    ":separatePatchReleases",
+    "group:recommended"
+  ],
+
+  "timezone": "America/Lima",
+
+  "schedule": ["every weekend"],
+
+  "labels": ["dependencies", "renovate"],
+
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "branchConcurrentLimit": 10,
+
+  "commitMessagePrefix": "chore:",
+  "commitMessageAction": "update",
+
+  "dependencyDashboard": true,
+  "dependencyDashboardTitle": "🔄 Renovate Dependency Dashboard",
+
+  "packageRules": [
+    {
+      "_comment": "Auto-merge para actualizaciones patch de todas las deps",
+      "matchUpdateTypes": ["patch"],
+      "matchCurrentVersion": "!/^0/",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "_comment": "Auto-merge para actualizaciones minor de deps de desarrollo",
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true,
+      "labels": ["dependencies", "dev-dependencies", "automerge"]
+    },
+    {
+      "_comment": "Actualizaciones major: NO auto-merge, añadir label de revisión",
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["dependencies", "major-update", "needs-manual-review"],
+      "reviewers": ["devops-lead"]
+    },
+    {
+      "_comment": "Agrupar todas las actualizaciones de TypeScript juntas",
+      "groupName": "TypeScript ecosystem",
+      "matchPackageNames": ["typescript", "ts-node", "@types/node"],
+      "matchUpdateTypes": ["minor", "patch"]
+    },
+    {
+      "_comment": "Agrupar ESLint y sus plugins",
+      "groupName": "ESLint ecosystem",
+      "matchPackagePrefixes": ["eslint", "@eslint/", "@typescript-eslint/"],
+      "matchUpdateTypes": ["minor", "patch"]
+    },
+    {
+      "_comment": "Agrupar React y sus dependencias relacionadas",
+      "groupName": "React ecosystem",
+      "matchPackageNames": ["react", "react-dom"],
+      "matchPackagePrefixes": ["@types/react"],
+      "matchUpdateTypes": ["minor", "patch"]
+    },
+    {
+      "_comment": "Fijar versión de una librería con breaking changes frecuentes",
+      "matchPackageNames": ["some-unstable-package"],
+      "enabled": false
+    }
+  ],
+
+  "vulnerabilityAlerts": {
+    "labels": ["security", "high-priority"],
+    "automerge": true,
+    "_comment": "Las actualizaciones de seguridad se auto-mergean siempre"
+  },
+
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on monday"],
+    "_comment": "Regenerar lock files una vez por semana"
+  },
+
+  "pip_requirements": {
+    "fileMatch": ["(^|/)requirements[\\w-]*\\.txt$"]
+  },
+
+  "docker": {
+    "pinDigests": true,
+    "_comment": "Pinear imágenes Docker por digest (SHA) para reproducibilidad"
+  }
+}

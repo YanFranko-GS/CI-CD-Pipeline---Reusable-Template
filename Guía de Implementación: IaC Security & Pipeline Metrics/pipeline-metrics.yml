@@ -1,0 +1,614 @@
+# =============================================================================
+# .github/workflows/pipeline-metrics.yml
+# Dashboard de métricas y salud del pipeline de CI/CD
+# =============================================================================
+#
+# PROPÓSITO:
+#   Recopilar, almacenar y visualizar métricas del pipeline de CI/CD:
+#   - Tiempos de ejecución de cada job (lead time)
+#   - Tasa de éxito/fracaso por workflow y rama
+#   - Frecuencia de deploys (deployment frequency — métrica DORA)
+#   - Tiempo de recuperación ante fallos (MTTR — Mean Time to Recovery)
+#   - Cobertura de tests a lo largo del tiempo
+#   - Número de PRs mergeadas por semana
+#   - Vulnerabilidades detectadas por sprint
+#
+# OUTPUTS:
+#   - Badge dinámico de estado del pipeline
+#   - Reporte Markdown en el Job Summary
+#   - Datos JSON almacenados como artefactos para histórico
+#   - (Opcional) Envío de métricas a Datadog/Grafana/InfluxDB
+#
+# TRIGGERS:
+#   - Al finalizar cualquier workflow principal (workflow_run)
+#   - Schedule semanal para reporte consolidado
+#   - workflow_dispatch para reporte bajo demanda
+# =============================================================================
+
+name: "📊 Pipeline Metrics & Health"
+
+on:
+  # Se dispara cuando cualquiera de estos workflows termina (éxito o fallo)
+  workflow_run:
+    workflows:
+      - "CI/CD Pipeline - Reusable Template"
+      - "🚀 Release on Demand"
+      - "🔒 IaC Security & Validation"
+      - "🤖 Auto-merge Dependabot PRs"
+    types:
+      - completed   # Se dispara al TERMINAR (éxito o fallo)
+
+  # Reporte semanal consolidado
+  schedule:
+    - cron: "0 8 * * 1"  # Lunes a las 08:00 UTC — inicio de semana laboral
+
+  # Generación manual de reporte
+  workflow_dispatch:
+    inputs:
+      period_days:
+        description: "Período de análisis en días"
+        required: false
+        default: "30"
+        type: choice
+        options:
+          - "7"
+          - "14"
+          - "30"
+          - "90"
+      export_format:
+        description: "Formato de exportación adicional"
+        required: false
+        default: "markdown"
+        type: choice
+        options:
+          - markdown
+          - json
+          - csv
+      send_to_external:
+        description: "Enviar métricas a sistema externo (Datadog, etc.)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write        # Actualizar el archivo de métricas en el repo
+  actions: read          # Leer el historial de runs de workflows
+  pull-requests: read    # Leer estadísticas de PRs
+
+concurrency:
+  group: pipeline-metrics
+  cancel-in-progress: false
+
+env:
+  # Número de días hacia atrás para el análisis
+  ANALYSIS_PERIOD_DAYS: ${{ github.event.inputs.period_days || '30' }}
+  # Archivo donde se almacenan las métricas históricas
+  METRICS_FILE: ".github/pipeline-metrics.json"
+
+jobs:
+
+  # ===========================================================================
+  # JOB 1: RECOPILAR MÉTRICAS DEL PIPELINE VÍA GITHUB API
+  # ===========================================================================
+  collect-metrics:
+    name: "📥 Recopilar métricas"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    outputs:
+      metrics_json: ${{ steps.collect.outputs.metrics_json }}
+      deploy_frequency: ${{ steps.dora.outputs.deploy_frequency }}
+      success_rate: ${{ steps.collect.outputs.success_rate }}
+      avg_duration: ${{ steps.collect.outputs.avg_duration }}
+      mttr_hours: ${{ steps.dora.outputs.mttr_hours }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Recopilar métricas via GitHub API con el CLI de gh
+      # -----------------------------------------------------------------------
+      - name: "📊 Recopilar métricas de workflows"
+        id: collect
+        run: |
+          PERIOD="${{ env.ANALYSIS_PERIOD_DAYS }}"
+          SINCE_DATE=$(date -d "$PERIOD days ago" --iso-8601=seconds 2>/dev/null || \
+                       date -v-${PERIOD}d +"%Y-%m-%dT%H:%M:%SZ")
+
+          echo "Analizando los últimos $PERIOD días desde: $SINCE_DATE"
+          echo "Repositorio: ${{ github.repository }}"
+
+          # ===================================================================
+          # MÉTRICAS DE WORKFLOW RUNS
+          # ===================================================================
+          echo "📋 Obteniendo historial de workflow runs..."
+
+          # Obtener todos los workflow runs en el período
+          RUNS_JSON=$(gh api \
+            "repos/${{ github.repository }}/actions/runs" \
+            --jq ".workflow_runs | map(select(.created_at >= \"$SINCE_DATE\"))" \
+            --paginate 2>/dev/null || echo "[]")
+
+          # Calcular estadísticas
+          TOTAL_RUNS=$(echo "$RUNS_JSON" | jq 'length')
+          SUCCESS_RUNS=$(echo "$RUNS_JSON" | jq '[.[] | select(.conclusion == "success")] | length')
+          FAILURE_RUNS=$(echo "$RUNS_JSON" | jq '[.[] | select(.conclusion == "failure")] | length')
+          CANCELLED_RUNS=$(echo "$RUNS_JSON" | jq '[.[] | select(.conclusion == "cancelled")] | length')
+
+          # Tasa de éxito (evitar división por cero)
+          if [ "$TOTAL_RUNS" -gt 0 ]; then
+            SUCCESS_RATE=$(echo "scale=1; $SUCCESS_RUNS * 100 / $TOTAL_RUNS" | bc)
+          else
+            SUCCESS_RATE="0"
+          fi
+
+          echo "Total runs: $TOTAL_RUNS"
+          echo "Éxitos: $SUCCESS_RUNS ($SUCCESS_RATE%)"
+          echo "Fallos: $FAILURE_RUNS"
+          echo "Cancelados: $CANCELLED_RUNS"
+
+          # ===================================================================
+          # DURACIÓN PROMEDIO DE RUNS
+          # ===================================================================
+          echo "⏱️ Calculando duración promedio..."
+
+          # Calcular duración en segundos para cada run completado
+          AVG_DURATION_SEC=$(echo "$RUNS_JSON" | jq '
+            [.[] |
+              select(.conclusion != null and .run_started_at != null and .updated_at != null) |
+              ((.updated_at | fromdateiso8601) - (.run_started_at | fromdateiso8601))
+            ] |
+            if length > 0 then (add / length | round) else 0 end
+          ' 2>/dev/null || echo "0")
+
+          AVG_DURATION_MIN=$(echo "scale=1; $AVG_DURATION_SEC / 60" | bc 2>/dev/null || echo "0")
+          echo "Duración promedio: ${AVG_DURATION_MIN} minutos"
+
+          # ===================================================================
+          # MÉTRICAS POR WORKFLOW
+          # ===================================================================
+          echo "📈 Calculando métricas por workflow..."
+
+          BY_WORKFLOW=$(echo "$RUNS_JSON" | jq '
+            group_by(.name) |
+            map({
+              name: .[0].name,
+              total: length,
+              success: [.[] | select(.conclusion == "success")] | length,
+              failure: [.[] | select(.conclusion == "failure")] | length,
+              avg_duration_min: (
+                [.[] |
+                  select(.conclusion != null and .run_started_at != null) |
+                  ((.updated_at | fromdateiso8601) - (.run_started_at | fromdateiso8601)) / 60
+                ] | if length > 0 then (add / length * 10 | round / 10) else 0 end
+              )
+            })
+          ' 2>/dev/null || echo "[]")
+
+          # ===================================================================
+          # MÉTRICAS DE PRs
+          # ===================================================================
+          echo "🔀 Obteniendo métricas de Pull Requests..."
+
+          PRS_JSON=$(gh api \
+            "repos/${{ github.repository }}/pulls" \
+            --field state=closed \
+            --field per_page=100 \
+            --jq ".[] | select(.merged_at >= \"$SINCE_DATE\")" \
+            2>/dev/null | jq -s '.' || echo "[]")
+
+          TOTAL_PRS=$(echo "$PRS_JSON" | jq 'length')
+          echo "PRs mergeadas en el período: $TOTAL_PRS"
+
+          # Tiempo promedio de PR en abierto (tiempo hasta merge)
+          AVG_PR_TIME=$(echo "$PRS_JSON" | jq '
+            [.[] |
+              select(.merged_at != null and .created_at != null) |
+              ((.merged_at | fromdateiso8601) - (.created_at | fromdateiso8601)) / 3600
+            ] |
+            if length > 0 then (add / length * 10 | round / 10) else 0 end
+          ' 2>/dev/null || echo "0")
+          echo "Tiempo promedio de PR hasta merge: ${AVG_PR_TIME} horas"
+
+          # ===================================================================
+          # COMPILAR MÉTRICAS EN JSON
+          # ===================================================================
+          TIMESTAMP=$(date --iso-8601=seconds)
+
+          METRICS_JSON=$(jq -n \
+            --arg timestamp "$TIMESTAMP" \
+            --arg period "$PERIOD" \
+            --arg repo "${{ github.repository }}" \
+            --argjson total_runs "$TOTAL_RUNS" \
+            --argjson success_runs "$SUCCESS_RUNS" \
+            --argjson failure_runs "$FAILURE_RUNS" \
+            --argjson cancelled_runs "$CANCELLED_RUNS" \
+            --arg success_rate "$SUCCESS_RATE" \
+            --arg avg_duration_min "$AVG_DURATION_MIN" \
+            --argjson by_workflow "$BY_WORKFLOW" \
+            --argjson total_prs "$TOTAL_PRS" \
+            --arg avg_pr_time "$AVG_PR_TIME" \
+            '{
+              timestamp: $timestamp,
+              period_days: ($period | tonumber),
+              repository: $repo,
+              pipeline: {
+                total_runs: $total_runs,
+                success_runs: $success_runs,
+                failure_runs: $failure_runs,
+                cancelled_runs: $cancelled_runs,
+                success_rate_pct: ($success_rate | tonumber),
+                avg_duration_minutes: ($avg_duration_min | tonumber)
+              },
+              by_workflow: $by_workflow,
+              pull_requests: {
+                merged_count: $total_prs,
+                avg_time_to_merge_hours: ($avg_pr_time | tonumber)
+              }
+            }')
+
+          # Guardar como output (escapando newlines para GITHUB_OUTPUT)
+          echo "metrics_json<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$METRICS_JSON" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "success_rate=$SUCCESS_RATE" >> "$GITHUB_OUTPUT"
+          echo "avg_duration=$AVG_DURATION_MIN" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Calcular métricas DORA (DevOps Research and Assessment)
+      # Las 4 métricas DORA son el estándar de la industria para medir
+      # la performance de equipos de ingeniería de software.
+      # -----------------------------------------------------------------------
+      - name: "📐 Calcular métricas DORA"
+        id: dora
+        run: |
+          PERIOD="${{ env.ANALYSIS_PERIOD_DAYS }}"
+          SINCE_DATE=$(date -d "$PERIOD days ago" --iso-8601=seconds 2>/dev/null || \
+                       date -v-${PERIOD}d +"%Y-%m-%dT%H:%M:%SZ")
+
+          # ===================================================================
+          # DORA METRIC 1: Deployment Frequency
+          # ¿Con qué frecuencia el equipo despliega a producción?
+          # Elite: Multiple deploys per day
+          # High: Between once per day and once per week
+          # Medium: Between once per week and once per month
+          # Low: Less than once per month
+          # ===================================================================
+          echo "📊 DORA #1: Deployment Frequency"
+
+          # Contar releases/tags creados en el período (proxies de deploys)
+          DEPLOY_COUNT=$(gh api \
+            "repos/${{ github.repository }}/releases" \
+            --jq "[.[] | select(.created_at >= \"$SINCE_DATE\")] | length" \
+            2>/dev/null || echo "0")
+
+          # Frequency por semana
+          WEEKS=$(echo "scale=2; $PERIOD / 7" | bc)
+          if [ "$WEEKS" != "0" ]; then
+            DEPLOY_FREQ=$(echo "scale=2; $DEPLOY_COUNT / $WEEKS" | bc)
+          else
+            DEPLOY_FREQ="0"
+          fi
+
+          # Clasificar nivel DORA
+          DEPLOY_FREQ_INT=${DEPLOY_FREQ%.*}
+          if [ "${DEPLOY_FREQ_INT:-0}" -ge 7 ]; then
+            DORA_DEPLOY_LEVEL="Elite ⭐"
+          elif [ "${DEPLOY_FREQ_INT:-0}" -ge 1 ]; then
+            DORA_DEPLOY_LEVEL="High 🟢"
+          elif [ "$DEPLOY_COUNT" -gt 0 ]; then
+            DORA_DEPLOY_LEVEL="Medium 🟡"
+          else
+            DORA_DEPLOY_LEVEL="Low 🔴"
+          fi
+
+          echo "Deploys en el período: $DEPLOY_COUNT"
+          echo "Frecuencia: $DEPLOY_FREQ deploys/semana ($DORA_DEPLOY_LEVEL)"
+
+          # ===================================================================
+          # DORA METRIC 2: Lead Time for Changes
+          # Tiempo desde commit hasta despliegue en producción
+          # (Aproximación: tiempo entre primer commit de una PR y su merge)
+          # ===================================================================
+          echo "📊 DORA #2: Lead Time for Changes"
+
+          LEAD_TIME=$(gh api \
+            "repos/${{ github.repository }}/pulls" \
+            --field state=closed \
+            --field per_page=50 \
+            --jq "
+              [.[] |
+                select(.merged_at != null and .merged_at >= \"$SINCE_DATE\") |
+                ((.merged_at | fromdateiso8601) - (.created_at | fromdateiso8601)) / 3600
+              ] |
+              if length > 0 then (add / length * 10 | round / 10) else 0 end
+            " 2>/dev/null || echo "0")
+
+          if (( $(echo "$LEAD_TIME < 1" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_LEAD_LEVEL="Elite ⭐ (<1h)"
+          elif (( $(echo "$LEAD_TIME < 24" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_LEAD_LEVEL="High 🟢 (<1 día)"
+          elif (( $(echo "$LEAD_TIME < 168" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_LEAD_LEVEL="Medium 🟡 (<1 semana)"
+          else
+            DORA_LEAD_LEVEL="Low 🔴 (>1 semana)"
+          fi
+
+          echo "Lead time promedio: ${LEAD_TIME}h ($DORA_LEAD_LEVEL)"
+
+          # ===================================================================
+          # DORA METRIC 3: Change Failure Rate
+          # % de deployments que causan fallos en producción
+          # (Aproximación: % de workflows de deploy que fallaron)
+          # ===================================================================
+          echo "📊 DORA #3: Change Failure Rate"
+
+          PIPELINE_SUCCESS="${{ steps.collect.outputs.success_rate }}"
+          FAILURE_RATE=$(echo "scale=1; 100 - ${PIPELINE_SUCCESS:-0}" | bc 2>/dev/null || echo "0")
+
+          if (( $(echo "$FAILURE_RATE < 5" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_FAILURE_LEVEL="Elite ⭐ (<5%)"
+          elif (( $(echo "$FAILURE_RATE < 10" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_FAILURE_LEVEL="High 🟢 (<10%)"
+          elif (( $(echo "$FAILURE_RATE < 15" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_FAILURE_LEVEL="Medium 🟡 (<15%)"
+          else
+            DORA_FAILURE_LEVEL="Low 🔴 (>15%)"
+          fi
+
+          echo "Change failure rate: ${FAILURE_RATE}% ($DORA_FAILURE_LEVEL)"
+
+          # ===================================================================
+          # DORA METRIC 4: Mean Time to Recovery (MTTR)
+          # Tiempo promedio para recuperarse de un fallo en producción
+          # (Aproximación: tiempo entre un workflow fallido y el siguiente exitoso)
+          # ===================================================================
+          echo "📊 DORA #4: Mean Time to Recovery (MTTR)"
+
+          # Obtener runs del workflow principal ordenados por fecha
+          MAIN_RUNS=$(gh api \
+            "repos/${{ github.repository }}/actions/runs" \
+            --jq "
+              .workflow_runs |
+              map(select(.created_at >= \"$SINCE_DATE\" and .conclusion != null)) |
+              sort_by(.created_at)
+            " 2>/dev/null || echo "[]")
+
+          # Calcular tiempo entre fallo y recuperación
+          MTTR=$(echo "$MAIN_RUNS" | jq '
+            [
+              range(length - 1) |
+              . as $i |
+              if (.[$i].conclusion == "failure" and .[$i + 1].conclusion == "success") then
+                ((.[$i + 1].created_at | fromdateiso8601) - (.[$i].created_at | fromdateiso8601)) / 3600
+              else empty end
+            ] |
+            if length > 0 then (add / length * 10 | round / 10) else 0 end
+          ' 2>/dev/null || echo "0")
+
+          if (( $(echo "$MTTR < 1" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_MTTR_LEVEL="Elite ⭐ (<1h)"
+          elif (( $(echo "$MTTR < 24" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_MTTR_LEVEL="High 🟢 (<1 día)"
+          elif (( $(echo "$MTTR < 168" | bc -l 2>/dev/null || echo 0) )); then
+            DORA_MTTR_LEVEL="Medium 🟡 (<1 semana)"
+          else
+            DORA_MTTR_LEVEL="Low 🔴 (>1 semana)"
+          fi
+
+          echo "MTTR promedio: ${MTTR}h ($DORA_MTTR_LEVEL)"
+
+          # Exportar outputs
+          echo "deploy_frequency=$DEPLOY_FREQ" >> "$GITHUB_OUTPUT"
+          echo "deploy_count=$DEPLOY_COUNT"     >> "$GITHUB_OUTPUT"
+          echo "lead_time=$LEAD_TIME"           >> "$GITHUB_OUTPUT"
+          echo "failure_rate=$FAILURE_RATE"     >> "$GITHUB_OUTPUT"
+          echo "mttr_hours=$MTTR"               >> "$GITHUB_OUTPUT"
+          echo "dora_deploy=$DORA_DEPLOY_LEVEL" >> "$GITHUB_OUTPUT"
+          echo "dora_lead=$DORA_LEAD_LEVEL"     >> "$GITHUB_OUTPUT"
+          echo "dora_failure=$DORA_FAILURE_LEVEL" >> "$GITHUB_OUTPUT"
+          echo "dora_mttr=$DORA_MTTR_LEVEL"    >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # JOB 2: GENERAR DASHBOARD Y REPORTE
+  # ===========================================================================
+  generate-dashboard:
+    name: "📊 Generar Dashboard"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: collect-metrics
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Generar reporte Markdown completo en el Job Summary de GitHub
+      # -----------------------------------------------------------------------
+      - name: "📊 Generar reporte en Job Summary"
+        run: |
+          PERIOD="${{ env.ANALYSIS_PERIOD_DAYS }}"
+          SUCCESS_RATE="${{ needs.collect-metrics.outputs.success_rate }}"
+          AVG_DURATION="${{ needs.collect-metrics.outputs.avg_duration }}"
+          DEPLOY_FREQ="${{ needs.collect-metrics.outputs.deploy_frequency }}"
+          MTTR="${{ needs.collect-metrics.outputs.mttr_hours }}"
+
+          # Emojis de estado basados en los valores
+          rate_emoji() {
+            local rate=$1
+            if (( $(echo "$rate >= 95" | bc -l 2>/dev/null || echo 0) )); then echo "🟢"
+            elif (( $(echo "$rate >= 80" | bc -l 2>/dev/null || echo 0) )); then echo "🟡"
+            else echo "🔴"
+            fi
+          }
+
+          STATUS_EMOJI=$(rate_emoji "$SUCCESS_RATE")
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 📊 Pipeline Health Dashboard
+
+          > **Período:** Últimos $PERIOD días | **Generado:** $(date "+%Y-%m-%d %H:%M UTC") | **Repo:** ${{ github.repository }}
+
+          ---
+
+          ## 🎯 Métricas DORA
+
+          | Métrica | Valor | Nivel |
+          |---------|-------|-------|
+          | 🚀 Deployment Frequency | ${{ needs.collect-metrics.outputs.deploy_frequency }} deploys/semana | ${{ needs.collect-metrics.outputs.dora_deploy }} |
+          | ⏱️ Lead Time for Changes | ${{ needs.collect-metrics.outputs.lead_time }}h promedio | ${{ needs.collect-metrics.outputs.dora_lead }} |
+          | ❌ Change Failure Rate | ${{ needs.collect-metrics.outputs.failure_rate }}% | ${{ needs.collect-metrics.outputs.dora_failure }} |
+          | 🔧 Mean Time to Recovery | ${{ needs.collect-metrics.outputs.mttr_hours }}h | ${{ needs.collect-metrics.outputs.dora_mttr }} |
+
+          ### Referencia de niveles DORA
+          | Nivel | Deployment Freq | Lead Time | Failure Rate | MTTR |
+          |-------|----------------|-----------|-------------|------|
+          | ⭐ Elite | >1/día | <1h | <5% | <1h |
+          | 🟢 High | 1/semana-1/día | 1d-1sem | 5-10% | 1h-1d |
+          | 🟡 Medium | 1/mes-1/sem | 1sem-1mes | 10-15% | 1d-1sem |
+          | 🔴 Low | <1/mes | >1mes | >15% | >1sem |
+
+          ---
+
+          ## 📈 Métricas del Pipeline (últimos $PERIOD días)
+
+          | Métrica | Valor |
+          |---------|-------|
+          | $STATUS_EMOJI Tasa de éxito | **$SUCCESS_RATE%** |
+          | ⏱️ Duración promedio | $AVG_DURATION minutos |
+          | 🚀 Deploys completados | ${{ needs.collect-metrics.outputs.deploy_count }} |
+          | 🔀 PRs mergeadas | (ver detalle en colección de métricas) |
+
+          ---
+
+          ## 💡 Recomendaciones
+
+          $([ $(echo "${SUCCESS_RATE:-0} < 80" | bc -l 2>/dev/null || echo 0) -eq 1 ] && echo "- ⚠️ **Tasa de éxito baja**: Revisar los workflows que están fallando con más frecuencia")
+          $([ $(echo "${AVG_DURATION:-0} > 30" | bc -l 2>/dev/null || echo 0) -eq 1 ] && echo "- ⚡ **Pipeline lento**: Considerar paralelizar jobs o mejorar el caché de dependencias")
+          $([ $(echo "${MTTR:-0} > 24" | bc -l 2>/dev/null || echo 0) -eq 1 ] && echo "- 🔧 **MTTR alto**: Mejorar los smoke tests y el proceso de rollback automático")
+
+          ---
+
+          *Dashboard generado automáticamente por el workflow \`pipeline-metrics.yml\`*
+          *Para historial completo, revisar los artefactos adjuntos al workflow run*
+          EOF
+
+      # -----------------------------------------------------------------------
+      # Guardar métricas históricas como artefacto
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar métricas como artefacto"
+        run: |
+          mkdir -p /tmp/metrics-report
+
+          # Guardar el JSON de métricas
+          echo '${{ needs.collect-metrics.outputs.metrics_json }}' | \
+            jq '.' > /tmp/metrics-report/metrics-$(date +%Y%m%d).json
+
+          # Crear CSV para exportar a hojas de cálculo
+          echo "timestamp,success_rate,avg_duration_min,deploy_frequency,mttr_hours" > \
+            /tmp/metrics-report/metrics-timeseries.csv
+          echo "$(date --iso-8601),${{ needs.collect-metrics.outputs.success_rate }},${{ needs.collect-metrics.outputs.avg_duration }},${{ needs.collect-metrics.outputs.deploy_frequency }},${{ needs.collect-metrics.outputs.mttr_hours }}" >> \
+            /tmp/metrics-report/metrics-timeseries.csv
+
+          ls -la /tmp/metrics-report/
+
+      - name: "📤 Upload métricas como artefacto"
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-metrics-${{ github.run_id }}
+          path: /tmp/metrics-report/
+          retention-days: 90  # Mantener 90 días de histórico
+
+      # -----------------------------------------------------------------------
+      # Enviar métricas a sistema externo (Datadog, InfluxDB, Grafana)
+      # -----------------------------------------------------------------------
+      - name: "📡 Enviar métricas a Datadog"
+        if: |
+          github.event.inputs.send_to_external == 'true' &&
+          secrets.DATADOG_API_KEY != ''
+        run: |
+          # Enviar métricas a Datadog via API
+          TIMESTAMP=$(date +%s)
+
+          # Formatear métricas en el formato de series de Datadog
+          PAYLOAD=$(jq -n \
+            --arg ts "$TIMESTAMP" \
+            --arg success_rate "${{ needs.collect-metrics.outputs.success_rate }}" \
+            --arg avg_duration "${{ needs.collect-metrics.outputs.avg_duration }}" \
+            --arg deploy_freq "${{ needs.collect-metrics.outputs.deploy_frequency }}" \
+            --arg mttr "${{ needs.collect-metrics.outputs.mttr_hours }}" \
+            --arg repo "${{ github.repository }}" \
+            '{
+              series: [
+                {
+                  metric: "github.actions.success_rate",
+                  points: [[$ts | tonumber, $success_rate | tonumber]],
+                  tags: ["repo:" + $repo, "env:ci"]
+                },
+                {
+                  metric: "github.actions.avg_duration_minutes",
+                  points: [[$ts | tonumber, $avg_duration | tonumber]],
+                  tags: ["repo:" + $repo, "env:ci"]
+                },
+                {
+                  metric: "github.actions.deploy_frequency",
+                  points: [[$ts | tonumber, $deploy_freq | tonumber]],
+                  tags: ["repo:" + $repo, "env:ci"]
+                },
+                {
+                  metric: "github.actions.mttr_hours",
+                  points: [[$ts | tonumber, $mttr | tonumber]],
+                  tags: ["repo:" + $repo, "env:ci"]
+                }
+              ]
+            }')
+
+          curl -sf -X POST \
+            "https://api.datadoghq.com/api/v1/series" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -d "$PAYLOAD"
+
+          echo "✅ Métricas enviadas a Datadog"
+
+      # -----------------------------------------------------------------------
+      # Notificar resumen a Slack si hay degradación en las métricas
+      # -----------------------------------------------------------------------
+      - name: "🔔 Alertar si hay degradación de métricas"
+        if: |
+          secrets.SLACK_WEBHOOK_URL != '' &&
+          (needs.collect-metrics.outputs.success_rate < '80' ||
+           needs.collect-metrics.outputs.mttr_hours > '24')
+        run: |
+          SUCCESS_RATE="${{ needs.collect-metrics.outputs.success_rate }}"
+          MTTR="${{ needs.collect-metrics.outputs.mttr_hours }}"
+
+          ALERTS=""
+          if (( $(echo "$SUCCESS_RATE < 80" | bc -l 2>/dev/null || echo 0) )); then
+            ALERTS="$ALERTS\n• ⚠️ Tasa de éxito baja: *${SUCCESS_RATE}%* (umbral: 80%)"
+          fi
+          if (( $(echo "$MTTR > 24" | bc -l 2>/dev/null || echo 0) )); then
+            ALERTS="$ALERTS\n• ⚠️ MTTR alto: *${MTTR}h* (umbral: 24h)"
+          fi
+
+          curl -sf -X POST \
+            -H "Content-type: application/json" \
+            --data "{
+              \"text\": \"⚠️ *Alerta de métricas del pipeline — ${{ github.repository }}*\",
+              \"blocks\": [{
+                \"type\": \"section\",
+                \"text\": {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"⚠️ *Degradación detectada en el pipeline:*\n$ALERTS\n\n🔗 <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver reporte completo>\"
+                }
+              }]
+            }" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

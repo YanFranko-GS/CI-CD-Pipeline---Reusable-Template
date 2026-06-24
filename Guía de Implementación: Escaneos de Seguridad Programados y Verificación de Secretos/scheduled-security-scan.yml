@@ -1,0 +1,870 @@
+# =============================================================================
+# .github/workflows/scheduled-security-scan.yml
+# Escaneo periódico de seguridad: dependencias, imágenes, análisis semántico
+# =============================================================================
+#
+# PROPÓSITO:
+#   Las vulnerabilidades (CVEs) se publican CONTINUAMENTE, incluso cuando el
+#   código del repositorio no cambia. Un escaneo en cada push no es suficiente.
+#   Este workflow ejecuta análisis de seguridad periódicamente para detectar:
+#     - Nuevas CVEs en dependencias existentes
+#     - Vulnerabilidades en imágenes Docker ya publicadas
+#     - Problemas semánticos de seguridad (inyecciones, path traversal, etc.)
+#     - Comparativa con la línea base del último escaneo
+#
+# COMPLEMENTO AL PIPELINE CI/CD:
+#   El pipeline ci-cd.yml ya ejecuta Trivy en cada push/PR.
+#   Este workflow añade:
+#     1. Escaneo periódico independiente de commits (cron)
+#     2. Escaneo de la imagen Docker ya publicada (no solo del Dockerfile)
+#     3. Snyk monitor (envía hallazgos continuamente a la plataforma Snyk)
+#     4. CodeQL profundo (el autobuild hace un análisis más exhaustivo)
+#     5. Notificación con resumen cuantificado de severidades
+#
+# PREREQUISITOS (secrets en Settings → Secrets → Actions):
+#   - SNYK_TOKEN           → app.snyk.io → Account Settings → API Token
+#   - SNYK_ORG             → app.snyk.io → Organization Settings → Slug
+#   - DOCKER_HUB_USERNAME  → (si la imagen es privada)
+#   - DOCKER_HUB_TOKEN     → hub.docker.com → Account Settings → Security
+#   - SLACK_WEBHOOK_URL    → Slack API → Incoming Webhooks
+#
+# PREREQUISITOS (variables en Settings → Variables → Actions):
+#   - IMAGE_NAME           → ej: "mi-org/mi-app" (sin tag)
+#   - IMAGE_REGISTRY       → ej: "docker.io" (default) o "ghcr.io"
+#   - TRIVY_SEVERITY       → ej: "CRITICAL,HIGH" (default)
+#   - TRIVY_IGNORE_UNFIXED → "true" o "false" (default: "true")
+#   - SCAN_BRANCH          → rama a escanear (default: main)
+#   - NOTIFY_SLACK         → "true" o "false" (default: "true")
+#   - VULN_THRESHOLD_CRITICAL → número de CVE críticos que disparan alerta (default: 0)
+#   - VULN_THRESHOLD_HIGH     → número de CVE high que disparan alerta (default: 5)
+# =============================================================================
+
+name: "🔍 Scheduled Security Scan"
+
+on:
+  # -------------------------------------------------------------------------
+  # SCHEDULE: Escaneo automático periódico
+  # GitHub Actions usa UTC. Los crons respetan la hora UTC estrictamente.
+  # -------------------------------------------------------------------------
+  schedule:
+    # Por defecto: cada lunes a las 06:00 UTC
+    # Elegir un horario de baja actividad para no afectar el equipo
+    - cron: "0 6 * * 1"
+
+    # Opciones alternativas (descomenta la que necesites y comenta la anterior):
+    # Diario a las 06:00 UTC:
+    # - cron: "0 6 * * *"
+    # Dos veces por semana (lunes y jueves):
+    # - cron: "0 6 * * 1,4"
+    # Mensual (primer día del mes):
+    # - cron: "0 6 1 * *"
+    # Cada 12 horas (para proyectos críticos):
+    # - cron: "0 */12 * * *"
+
+  # Activación manual para ejecutar el escaneo en cualquier momento
+  # Útil después de un incidente de seguridad o antes de un release importante
+  workflow_dispatch:
+    inputs:
+      scan_branch:
+        description: "Rama a escanear"
+        required: false
+        default: "main"
+        type: string
+      severity_filter:
+        description: "Severidades a reportar (CRITICAL,HIGH,MEDIUM,LOW)"
+        required: false
+        default: "CRITICAL,HIGH"
+        type: string
+      scan_image:
+        description: "Escanear imagen Docker publicada (requiere IMAGE_NAME configurado)"
+        required: false
+        default: true
+        type: boolean
+      run_snyk:
+        description: "Ejecutar Snyk (requiere SNYK_TOKEN configurado)"
+        required: false
+        default: true
+        type: boolean
+      run_codeql:
+        description: "Ejecutar análisis profundo de CodeQL"
+        required: false
+        default: true
+        type: boolean
+      notify_always:
+        description: "Notificar a Slack aunque no haya vulnerabilidades"
+        required: false
+        default: false
+        type: boolean
+
+# =============================================================================
+# PERMISOS — Principio de menor privilegio
+# =============================================================================
+permissions:
+  contents: read         # Leer el código fuente
+  security-events: write # Subir resultados SARIF al Security tab
+  actions: read          # Leer artefactos de runs anteriores (para comparativas)
+  id-token: write        # OIDC (si se usa para autenticación en registros privados)
+
+# =============================================================================
+# CONCURRENCIA
+# No cancelar escaneos en progreso: un escaneo a medias no tiene valor
+# =============================================================================
+concurrency:
+  group: scheduled-security-${{ github.ref }}
+  cancel-in-progress: false
+
+# =============================================================================
+# VARIABLES GLOBALES
+# Usar vars.X para variables no sensibles, secrets.X para sensibles
+# =============================================================================
+env:
+  # Rama objetivo del escaneo
+  SCAN_BRANCH: ${{ github.event.inputs.scan_branch || vars.SCAN_BRANCH || 'main' }}
+  # Severidades a reportar
+  TRIVY_SEVERITY: ${{ github.event.inputs.severity_filter || vars.TRIVY_SEVERITY || 'CRITICAL,HIGH' }}
+  # Ignorar vulnerabilidades sin parche disponible (reduce falsos positivos accionables)
+  TRIVY_IGNORE_UNFIXED: ${{ vars.TRIVY_IGNORE_UNFIXED || 'true' }}
+  # Imagen Docker a escanear (vacío = saltar el escaneo de imagen)
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || '' }}
+  IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY || 'docker.io' }}
+  # Umbrales para alertas
+  VULN_THRESHOLD_CRITICAL: ${{ vars.VULN_THRESHOLD_CRITICAL || '0' }}
+  VULN_THRESHOLD_HIGH: ${{ vars.VULN_THRESHOLD_HIGH || '5' }}
+  # Control de notificaciones
+  NOTIFY_SLACK: ${{ vars.NOTIFY_SLACK || 'true' }}
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+
+  # ===========================================================================
+  # JOB 1: TRIVY FILESYSTEM SCAN
+  # Escanea el código fuente, dependencias y archivos de configuración
+  # ===========================================================================
+  trivy-fs:
+    name: "🔬 Trivy — Filesystem & Dependencies"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      # Exportar conteos de vulnerabilidades para el job de notificación
+      critical_count: ${{ steps.count.outputs.critical }}
+      high_count: ${{ steps.count.outputs.high }}
+      medium_count: ${{ steps.count.outputs.medium }}
+      total_count: ${{ steps.count.outputs.total }}
+
+    steps:
+      - name: "📥 Checkout — rama ${{ env.SCAN_BRANCH }}"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SCAN_BRANCH }}
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Trivy FS: escanea el filesystem completo
+      # Detecta: vulnerabilidades en package.json, requirements.txt, pom.xml,
+      # go.mod, Gemfile, Cargo.toml + misconfigurations en .tf, Dockerfile, YAML
+      # -----------------------------------------------------------------------
+      - name: "🔬 Trivy — Filesystem scan (SARIF)"
+        id: trivy_fs
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-fs.sarif"
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: ${{ env.TRIVY_IGNORE_UNFIXED }}
+          # Tipos de escáner: vuln (vulnerabilidades), config (misconfigurations),
+          # secret (secretos hardcodeados), license (licencias problemáticas)
+          scanners: "vuln,secret,misconfig"
+          # Archivo de ignorados: permite suprimir falsos positivos conocidos
+          # trivyignore: ".trivyignore"
+          exit-code: "0"  # No fallar el workflow; el conteo determina la alerta
+          # Timeout para el escaneo (los proyectos grandes pueden tardar)
+          timeout: "20m"
+
+      # -----------------------------------------------------------------------
+      # Trivy FS: segunda pasada en formato tabla (para logs legibles)
+      # -----------------------------------------------------------------------
+      - name: "📋 Trivy — Reporte en texto"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "table"
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: ${{ env.TRIVY_IGNORE_UNFIXED }}
+          scanners: "vuln,secret,misconfig"
+          exit-code: "0"
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Subir resultados SARIF al Security tab de GitHub
+      # Los resultados aparecen en: Security → Code scanning → Trivy
+      # -----------------------------------------------------------------------
+      - name: "📤 Upload SARIF → GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-fs.sarif"
+          # category identifica la fuente en el Security tab
+          # Usar nombres distintos para no mezclar resultados de diferentes scans
+          category: "trivy-fs-scheduled"
+
+      # -----------------------------------------------------------------------
+      # Contar vulnerabilidades por severidad desde el SARIF (usando jq)
+      # Esto permite al job de notificación saber si debe alertar
+      # -----------------------------------------------------------------------
+      - name: "🔢 Contar vulnerabilidades por severidad"
+        id: count
+        run: |
+          # Verificar que el SARIF existe y tiene contenido
+          if [ ! -f "trivy-fs.sarif" ]; then
+            echo "⚠️ No se generó el archivo SARIF"
+            echo "critical=0" >> "$GITHUB_OUTPUT"
+            echo "high=0"     >> "$GITHUB_OUTPUT"
+            echo "medium=0"   >> "$GITHUB_OUTPUT"
+            echo "low=0"      >> "$GITHUB_OUTPUT"
+            echo "total=0"    >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extraer conteos por severidad desde el SARIF
+          # El formato SARIF almacena la severidad en rules[].properties.tags
+          CRITICAL=$(jq '[.runs[].results[] |
+            select(.properties.tags[]? | ascii_downcase | contains("critical"))
+          ] | length' trivy-fs.sarif 2>/dev/null || echo "0")
+
+          HIGH=$(jq '[.runs[].results[] |
+            select(.properties.tags[]? | ascii_downcase | contains("high"))
+          ] | length' trivy-fs.sarif 2>/dev/null || echo "0")
+
+          MEDIUM=$(jq '[.runs[].results[] |
+            select(.properties.tags[]? | ascii_downcase | contains("medium"))
+          ] | length' trivy-fs.sarif 2>/dev/null || echo "0")
+
+          LOW=$(jq '[.runs[].results[] |
+            select(.properties.tags[]? | ascii_downcase | contains("low"))
+          ] | length' trivy-fs.sarif 2>/dev/null || echo "0")
+
+          TOTAL=$(jq '.runs[].results | length' trivy-fs.sarif 2>/dev/null || echo "0")
+
+          echo "critical=$CRITICAL" >> "$GITHUB_OUTPUT"
+          echo "high=$HIGH"         >> "$GITHUB_OUTPUT"
+          echo "medium=$MEDIUM"     >> "$GITHUB_OUTPUT"
+          echo "low=$LOW"           >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL"       >> "$GITHUB_OUTPUT"
+
+          echo "============================================"
+          echo "🔢 Resumen de vulnerabilidades (Filesystem):"
+          echo "   🔴 CRITICAL: $CRITICAL"
+          echo "   🟠 HIGH:     $HIGH"
+          echo "   🟡 MEDIUM:   $MEDIUM"
+          echo "   🔵 LOW:      $LOW"
+          echo "   📊 TOTAL:    $TOTAL"
+          echo "============================================"
+
+      # -----------------------------------------------------------------------
+      # Guardar SARIF como artefacto para auditoría histórica
+      # Los artefactos permiten comparar escaneos a lo largo del tiempo
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar SARIF como artefacto"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "trivy-fs-sarif-${{ github.run_id }}"
+          path: "trivy-fs.sarif"
+          retention-days: 90  # 90 días de histórico para auditoría
+
+      # -----------------------------------------------------------------------
+      # Generar resumen en el Job Summary de GitHub
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## 🔬 Trivy Filesystem Scan
+
+          | Severidad | Cantidad |
+          |-----------|---------|
+          | 🔴 Critical | ${{ steps.count.outputs.critical }} |
+          | 🟠 High | ${{ steps.count.outputs.high }} |
+          | 🟡 Medium | ${{ steps.count.outputs.medium }} |
+          | 🔵 Low | ${{ steps.count.outputs.low }} |
+          | **Total** | **${{ steps.count.outputs.total }}** |
+
+          Rama escaneada: \`${{ env.SCAN_BRANCH }}\`
+          Filtro de severidad: \`${{ env.TRIVY_SEVERITY }}\`
+          Ignorar sin parche: \`${{ env.TRIVY_IGNORE_UNFIXED }}\`
+
+          📌 Ver detalles completos en: [Security → Code scanning](/${{ github.repository }}/security/code-scanning)
+          EOF
+
+  # ===========================================================================
+  # JOB 2: TRIVY IMAGE SCAN
+  # Escanea la imagen Docker publicada en el registry
+  # Se ejecuta en paralelo con trivy-fs
+  # ===========================================================================
+  trivy-image:
+    name: "🐳 Trivy — Docker Image"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Solo ejecutar si IMAGE_NAME está configurado Y el input lo permite
+    if: |
+      vars.IMAGE_NAME != '' &&
+      (github.event.inputs.scan_image != 'false')
+
+    outputs:
+      critical_count: ${{ steps.count.outputs.critical }}
+      high_count: ${{ steps.count.outputs.high }}
+      total_count: ${{ steps.count.outputs.total }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SCAN_BRANCH }}
+
+      # -----------------------------------------------------------------------
+      # Autenticar en Docker Hub si la imagen es privada
+      # Las imágenes públicas no requieren autenticación para Trivy
+      # IMPORTANTE: El login se realiza ANTES del escaneo para que Docker
+      # pueda descargar la imagen con credenciales
+      # -----------------------------------------------------------------------
+      - name: "🔐 Login Docker Hub (imagen privada)"
+        if: secrets.DOCKER_HUB_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          # NUNCA exponer el token en logs: docker login lo maneja internamente
+
+      # -----------------------------------------------------------------------
+      # Login a GHCR (GitHub Container Registry) si aplica
+      # -----------------------------------------------------------------------
+      - name: "🔐 Login GHCR"
+        if: env.IMAGE_REGISTRY == 'ghcr.io'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Trivy Image: escanea la imagen publicada en el registry
+      # A diferencia del FS scan, este analiza la imagen ya construida:
+      # - Paquetes del SO instalados en la imagen base
+      # - Dependencias de la aplicación dentro de la imagen
+      # - Misconfigurations en la imagen (usuario root, etc.)
+      # -----------------------------------------------------------------------
+      - name: "🔬 Trivy — Image scan"
+        id: trivy_image
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "image"
+          image-ref: "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          format: "sarif"
+          output: "trivy-image.sarif"
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: ${{ env.TRIVY_IGNORE_UNFIXED }}
+          # Escanear tanto vulnerabilidades como misconfigurations de la imagen
+          vuln-type: "os,library"
+          scanners: "vuln,secret,misconfig"
+          exit-code: "0"
+          timeout: "20m"
+
+      # -----------------------------------------------------------------------
+      # Escanear también un tag específico si existe (ej: el último release)
+      # Útil para verificar que las releases publicadas no tienen CVEs nuevas
+      # -----------------------------------------------------------------------
+      - name: "🔬 Trivy — Image scan (tag main)"
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true  # Puede no existir el tag "main"
+        with:
+          scan-type: "image"
+          image-ref: "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:main"
+          format: "table"
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: ${{ env.TRIVY_IGNORE_UNFIXED }}
+          exit-code: "0"
+
+      - name: "📤 Upload Image SARIF → GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-image.sarif"
+          category: "trivy-image-scheduled"
+
+      - name: "🔢 Contar vulnerabilidades (imagen)"
+        id: count
+        run: |
+          if [ ! -f "trivy-image.sarif" ]; then
+            echo "critical=0" >> "$GITHUB_OUTPUT"
+            echo "high=0"     >> "$GITHUB_OUTPUT"
+            echo "total=0"    >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CRITICAL=$(jq '[.runs[].results[] |
+            select(.properties.tags[]? | ascii_downcase | contains("critical"))
+          ] | length' trivy-image.sarif 2>/dev/null || echo "0")
+
+          HIGH=$(jq '[.runs[].results[] |
+            select(.properties.tags[]? | ascii_downcase | contains("high"))
+          ] | length' trivy-image.sarif 2>/dev/null || echo "0")
+
+          TOTAL=$(jq '.runs[].results | length' trivy-image.sarif 2>/dev/null || echo "0")
+
+          echo "critical=$CRITICAL" >> "$GITHUB_OUTPUT"
+          echo "high=$HIGH"         >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL"       >> "$GITHUB_OUTPUT"
+
+          echo "🐳 Vulnerabilidades en imagen: CRITICAL=$CRITICAL HIGH=$HIGH TOTAL=$TOTAL"
+
+      - name: "💾 Guardar Image SARIF"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "trivy-image-sarif-${{ github.run_id }}"
+          path: "trivy-image.sarif"
+          retention-days: 90
+
+  # ===========================================================================
+  # JOB 3: SNYK
+  # Análisis de dependencias con la base de datos de Snyk (complementa Trivy)
+  # Snyk tiene mayor cobertura de CVEs en ecosistemas específicos (npm, pip)
+  # ===========================================================================
+  snyk:
+    name: "🛡️ Snyk — Dependency Analysis"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Solo ejecutar si SNYK_TOKEN está configurado Y el input lo permite
+    if: |
+      secrets.SNYK_TOKEN != '' &&
+      (github.event.inputs.run_snyk != 'false')
+
+    outputs:
+      issues_count: ${{ steps.snyk_count.outputs.count }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SCAN_BRANCH }}
+
+      # -----------------------------------------------------------------------
+      # Detectar ecosistema para configurar el setup correcto
+      # Snyk necesita el runtime instalado para analizar los lockfiles
+      # -----------------------------------------------------------------------
+      - name: "🔍 Detectar ecosistema"
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then
+            echo "ecosystem=node" >> "$GITHUB_OUTPUT"
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            echo "ecosystem=python" >> "$GITHUB_OUTPUT"
+          elif [ -f "pom.xml" ]; then
+            echo "ecosystem=maven" >> "$GITHUB_OUTPUT"
+          elif [ -f "go.mod" ]; then
+            echo "ecosystem=go" >> "$GITHUB_OUTPUT"
+          elif [ -f "Gemfile" ]; then
+            echo "ecosystem=ruby" >> "$GITHUB_OUTPUT"
+          else
+            echo "ecosystem=node" >> "$GITHUB_OUTPUT"  # Fallback
+          fi
+
+      - name: "⚙️ Setup Node.js"
+        if: steps.detect.outputs.ecosystem == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: "⚙️ Setup Python"
+        if: steps.detect.outputs.ecosystem == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "⚙️ Setup Java"
+        if: steps.detect.outputs.ecosystem == 'maven'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      # -----------------------------------------------------------------------
+      # Instalar dependencias para que Snyk pueda leer el árbol de dependencias
+      # -----------------------------------------------------------------------
+      - name: "📦 Instalar dependencias (Node)"
+        if: steps.detect.outputs.ecosystem == 'node'
+        run: npm ci --prefer-offline 2>/dev/null || npm install --no-audit
+        continue-on-error: true
+
+      - name: "📦 Instalar dependencias (Python)"
+        if: steps.detect.outputs.ecosystem == 'python'
+        run: pip install -r requirements.txt 2>/dev/null || pip install . 2>/dev/null || true
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Snyk Test: análisis de vulnerabilidades con SARIF output
+      # snyk/actions/node funciona para todos los ecosistemas si Snyk CLI está instalado
+      # -----------------------------------------------------------------------
+      - name: "🛡️ Snyk — Security test"
+        id: snyk_test
+        uses: snyk/actions/node@master
+        continue-on-error: true  # No fallar el workflow; el conteo determina la alerta
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          # "test": escanea y reporta (no sube a Snyk platform)
+          # "monitor": escanea Y sube a Snyk platform para monitoreo continuo
+          command: monitor
+          args: >
+            --org=${{ secrets.SNYK_ORG || '' }}
+            --severity-threshold=high
+            --sarif-file-output=snyk.sarif
+            --all-projects
+            --detection-depth=3
+
+      # -----------------------------------------------------------------------
+      # Snyk Container: si hay una imagen configurada
+      # -----------------------------------------------------------------------
+      - name: "🛡️ Snyk — Container scan"
+        if: env.IMAGE_NAME != ''
+        uses: snyk/actions/docker@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          args: >
+            --org=${{ secrets.SNYK_ORG || '' }}
+            --severity-threshold=high
+            --file=Dockerfile
+        # Si la imagen es privada, ya debería estar autenticado por el job anterior
+        # o se puede añadir docker login aquí
+
+      - name: "📤 Upload Snyk SARIF → GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('snyk.sarif') != ''
+        with:
+          sarif_file: "snyk.sarif"
+          category: "snyk-scheduled"
+
+      - name: "🔢 Contar issues de Snyk"
+        id: snyk_count
+        run: |
+          COUNT=0
+          if [ -f "snyk.sarif" ]; then
+            COUNT=$(jq '.runs[].results | length' snyk.sarif 2>/dev/null || echo "0")
+          fi
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Issues de Snyk: $COUNT"
+
+  # ===========================================================================
+  # JOB 4: CODEQL — Análisis semántico profundo
+  # CodeQL detecta vulnerabilidades lógicas que los escáneres de CVE no ven:
+  # - SQL injection, XSS, path traversal, insecure deserialization
+  # - Flujo de datos tainted desde inputs del usuario hasta sinks peligrosos
+  # ===========================================================================
+  codeql:
+    name: "🔭 CodeQL — Semantic Analysis"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # CodeQL puede tardar bastante en proyectos grandes
+    if: github.event.inputs.run_codeql != 'false'
+
+    # Permisos específicos para CodeQL
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # CodeQL soporta: javascript, python, java, go, cpp, csharp, ruby, swift
+        # Detectar automáticamente qué lenguajes están en el repo
+        # Para proyectos multi-lenguaje, añadir múltiples entradas
+        language:
+          - javascript-typescript  # Node.js, TypeScript, JavaScript
+          # - python               # Descomenta si usas Python
+          # - java-kotlin          # Descomenta si usas Java/Kotlin
+          # - go                   # Descomenta si usas Go
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SCAN_BRANCH }}
+          fetch-depth: 0  # Historial completo para análisis más preciso
+
+      # -----------------------------------------------------------------------
+      # Inicializar CodeQL con las queries de seguridad Y calidad
+      # "security-and-quality" es más exhaustivo que solo "security-extended"
+      # -----------------------------------------------------------------------
+      - name: "🔭 CodeQL — Initialize"
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # Niveles de queries:
+          # "security-extended"     → Vulnerabilidades de seguridad (recomendado para CI/CD)
+          # "security-and-quality"  → Seguridad + calidad de código (más lento pero más completo)
+          # "default"               → Subset balanceado
+          queries: security-and-quality
+          # Para queries personalizadas (avanzado):
+          # config-file: .github/codeql-config.yml
+
+      # -----------------------------------------------------------------------
+      # Autobuild: CodeQL intenta compilar el proyecto automáticamente
+      # Para proyectos que no compilan con autobuild, reemplazar con comandos manuales
+      # -----------------------------------------------------------------------
+      - name: "🏗️ CodeQL — Autobuild"
+        uses: github/codeql-action/autobuild@v3
+        # Si autobuild falla, reemplazar con los comandos de build de tu proyecto:
+        # run: |
+        #   npm ci && npm run build
+        #   # o: mvn compile -q
+        #   # o: go build ./...
+
+      - name: "🔭 CodeQL — Analyze"
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "codeql-${{ matrix.language }}-scheduled"
+          # upload: true  → subir a GitHub automáticamente (default)
+          # output: sarif-results/  → directorio de salida
+
+  # ===========================================================================
+  # JOB 5: OSSAR — Open Source Static Analysis Results
+  # Combina múltiples herramientas de análisis estático en un solo job
+  # ===========================================================================
+  ossar:
+    name: "🔐 OSSAR — Multi-tool Static Analysis"
+    runs-on: windows-latest  # OSSAR solo funciona en Windows
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SCAN_BRANCH }}
+          fetch-depth: 0
+
+      - name: "🔐 Run OSSAR"
+        uses: github/ossar-action@v1
+        id: ossar
+
+      - name: "📤 Upload OSSAR SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.ossar.outputs.sarifFile }}
+          category: "ossar-scheduled"
+
+  # ===========================================================================
+  # JOB 6: DEPENDENCY REVIEW — Solo en PRs, pero útil en scheduled para check
+  # Detecta nuevas dependencias con licencias problemáticas
+  # ===========================================================================
+  license-check:
+    name: "📜 License & Dependency Review"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SCAN_BRANCH }}
+
+      # -----------------------------------------------------------------------
+      # FOSSA: Análisis de licencias de dependencias
+      # Detecta: GPL en proyectos comerciales, licencias incompatibles, etc.
+      # -----------------------------------------------------------------------
+      - name: "📜 FOSSA — License scan"
+        if: secrets.FOSSA_API_KEY != ''
+        uses: fossas/fossa-action@main
+        with:
+          api-key: ${{ secrets.FOSSA_API_KEY }}
+          run-tests: false  # Solo análisis, no ejecutar tests de licencias
+
+      # -----------------------------------------------------------------------
+      # license-checker para Node.js (alternativa sin token)
+      # -----------------------------------------------------------------------
+      - name: "📜 License checker (Node.js)"
+        if: hashFiles('package.json') != ''
+        run: |
+          npx --yes license-checker \
+            --summary \
+            --excludePrivatePackages \
+            --failOn "GPL-2.0;GPL-3.0;AGPL-3.0" \
+            2>/dev/null || echo "⚠️ Se encontraron licencias potencialmente problemáticas"
+        continue-on-error: true
+
+  # ===========================================================================
+  # JOB 7: NOTIFY — Resumen y notificación de resultados
+  # Se ejecuta SIEMPRE (incluso si los jobs anteriores fallaron)
+  # ===========================================================================
+  notify:
+    name: "🔔 Notificación de resultados"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Depender de todos los jobs para tener los datos completos
+    needs: [trivy-fs, trivy-image, snyk, codeql]
+    # Ejecutar siempre: sin notificación no sabemos si algo está mal
+    if: always()
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Descargar artefactos SARIF para análisis consolidado
+      # -----------------------------------------------------------------------
+      - name: "📥 Descargar artefactos SARIF"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-sarif-*"
+          path: /tmp/sarif-results/
+          merge-multiple: true
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Calcular totales consolidados de TODOS los escáneres
+      # -----------------------------------------------------------------------
+      - name: "🔢 Consolidar conteos de vulnerabilidades"
+        id: consolidate
+        run: |
+          # Conteos de Trivy FS
+          FS_CRITICAL="${{ needs.trivy-fs.outputs.critical_count || '0' }}"
+          FS_HIGH="${{ needs.trivy-fs.outputs.high_count || '0' }}"
+          FS_TOTAL="${{ needs.trivy-fs.outputs.total_count || '0' }}"
+
+          # Conteos de Trivy Image
+          IMG_CRITICAL="${{ needs.trivy-image.outputs.critical_count || '0' }}"
+          IMG_HIGH="${{ needs.trivy-image.outputs.high_count || '0' }}"
+          IMG_TOTAL="${{ needs.trivy-image.outputs.total_count || '0' }}"
+
+          # Conteos de Snyk
+          SNYK_ISSUES="${{ needs.snyk.outputs.issues_count || '0' }}"
+
+          # Totales combinados
+          TOTAL_CRITICAL=$((FS_CRITICAL + IMG_CRITICAL))
+          TOTAL_HIGH=$((FS_HIGH + IMG_HIGH))
+          TOTAL_ALL=$((FS_TOTAL + IMG_TOTAL + SNYK_ISSUES))
+
+          echo "total_critical=$TOTAL_CRITICAL" >> "$GITHUB_OUTPUT"
+          echo "total_high=$TOTAL_HIGH"         >> "$GITHUB_OUTPUT"
+          echo "total_all=$TOTAL_ALL"           >> "$GITHUB_OUTPUT"
+
+          # Determinar si se debe alertar
+          THRESHOLD_CRITICAL="${{ env.VULN_THRESHOLD_CRITICAL }}"
+          THRESHOLD_HIGH="${{ env.VULN_THRESHOLD_HIGH }}"
+
+          if [ "$TOTAL_CRITICAL" -gt "$THRESHOLD_CRITICAL" ] || \
+             [ "$TOTAL_HIGH" -gt "$THRESHOLD_HIGH" ]; then
+            echo "should_alert=true"  >> "$GITHUB_OUTPUT"
+            echo "status=⚠️ VULNERABILIDADES DETECTADAS" >> "$GITHUB_OUTPUT"
+            echo "color=danger"       >> "$GITHUB_OUTPUT"
+          else
+            echo "should_alert=false" >> "$GITHUB_OUTPUT"
+            echo "status=✅ Sin vulnerabilidades críticas" >> "$GITHUB_OUTPUT"
+            echo "color=good"         >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "============================================"
+          echo "📊 RESUMEN CONSOLIDADO:"
+          echo "   Trivy FS:    CRITICAL=$FS_CRITICAL HIGH=$FS_HIGH TOTAL=$FS_TOTAL"
+          echo "   Trivy Image: CRITICAL=$IMG_CRITICAL HIGH=$IMG_HIGH TOTAL=$IMG_TOTAL"
+          echo "   Snyk:        ISSUES=$SNYK_ISSUES"
+          echo "   TOTAL:       CRITICAL=$TOTAL_CRITICAL HIGH=$TOTAL_HIGH ALL=$TOTAL_ALL"
+          echo "   ALERTAR:     $([ \"$TOTAL_CRITICAL\" -gt \"$THRESHOLD_CRITICAL\" ] && echo 'SÍ' || echo 'NO')"
+          echo "============================================"
+
+      # -----------------------------------------------------------------------
+      # Notificación a Slack con resumen completo
+      # Se envía SIEMPRE si hay vulnerabilidades, o solo si notify_always=true
+      # -----------------------------------------------------------------------
+      - name: "💬 Notificar a Slack"
+        if: |
+          env.NOTIFY_SLACK == 'true' &&
+          secrets.SLACK_WEBHOOK_URL != '' &&
+          (steps.consolidate.outputs.should_alert == 'true' ||
+           github.event.inputs.notify_always == 'true')
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.consolidate.outputs.status }} — Escaneo de Seguridad Programado",
+              "attachments": [
+                {
+                  "color": "${{ steps.consolidate.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "🔍 Scheduled Security Scan — ${{ github.repository }}"
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Rama:*\n`${{ env.SCAN_BRANCH }}`"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Fecha:*\n${{ github.event.repository.updated_at }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*🔴 Critical:*\n${{ steps.consolidate.outputs.total_critical }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*🟠 High:*\n${{ steps.consolidate.outputs.total_high }}"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "*Herramientas ejecutadas:* Trivy FS + Trivy Image + Snyk + CodeQL\n*Total issues:* ${{ steps.consolidate.outputs.total_all }}\n\n<${{ github.server_url }}/${{ github.repository }}/security/code-scanning|Ver detalles en Security Tab> | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver logs del workflow>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # -----------------------------------------------------------------------
+      # Resumen final en el Job Summary
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary consolidado"
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 🔍 Scheduled Security Scan — Resumen
+
+          **Repositorio:** ${{ github.repository }}
+          **Rama:** ${{ env.SCAN_BRANCH }}
+          **Fecha:** $(date "+%Y-%m-%d %H:%M UTC")
+          **Estado:** ${{ steps.consolidate.outputs.status }}
+
+          ## Resultados por herramienta
+
+          | Herramienta | Estado | Critical | High | Total |
+          |-------------|--------|---------|------|-------|
+          | Trivy FS | ${{ needs.trivy-fs.result }} | ${{ needs.trivy-fs.outputs.critical_count || '—' }} | ${{ needs.trivy-fs.outputs.high_count || '—' }} | ${{ needs.trivy-fs.outputs.total_count || '—' }} |
+          | Trivy Image | ${{ needs.trivy-image.result }} | ${{ needs.trivy-image.outputs.critical_count || '—' }} | ${{ needs.trivy-image.outputs.high_count || '—' }} | ${{ needs.trivy-image.outputs.total_count || '—' }} |
+          | Snyk | ${{ needs.snyk.result }} | — | — | ${{ needs.snyk.outputs.issues_count || '—' }} |
+          | CodeQL | ${{ needs.codeql.result }} | — | — | — |
+
+          ## Totales consolidados
+
+          | Severidad | Cantidad | Umbral | Estado |
+          |-----------|---------|--------|--------|
+          | 🔴 Critical | ${{ steps.consolidate.outputs.total_critical }} | ${{ env.VULN_THRESHOLD_CRITICAL }} | ${{ steps.consolidate.outputs.total_critical > env.VULN_THRESHOLD_CRITICAL && '❌ Supera umbral' || '✅ OK' }} |
+          | 🟠 High | ${{ steps.consolidate.outputs.total_high }} | ${{ env.VULN_THRESHOLD_HIGH }} | ${{ steps.consolidate.outputs.total_high > env.VULN_THRESHOLD_HIGH && '❌ Supera umbral' || '✅ OK' }} |
+
+          📌 [Ver todos los detalles en el Security Tab](/${{ github.repository }}/security/code-scanning)
+          EOF

@@ -1,0 +1,720 @@
+# =============================================================================
+# .github/workflows/e2e-tests.yml
+# Pruebas End-to-End: Playwright, Cypress y Selenium
+# =============================================================================
+#
+# PROPÓSITO:
+#   Las pruebas E2E simulan el comportamiento real del usuario contra un entorno
+#   desplegado. Son lentas (minutos, no segundos) e inherentemente inestables
+#   por la naturaleza de las interfaces y redes. Por eso se ejecutan:
+#     - Bajo demanda (workflow_dispatch): antes de un release importante
+#     - Por label de PR (run-e2e): para validar funcionalidad crítica
+#     - Nocturnamente (schedule): suite completa en staging a horas de baja actividad
+#
+# HERRAMIENTAS SOPORTADAS:
+#   ✅ Playwright (por defecto, recomendado para proyectos nuevos)
+#   ✅ Cypress (para proyectos existentes con tests en Cypress)
+#   ✅ Selenium (para proyectos legacy o con grids remotos)
+#
+# ENTORNOS SOPORTADOS:
+#   - staging: entorno de integración permanente
+#   - preview: entorno efímero creado para el PR (Docker Compose o Vercel)
+#   - production: solo smoke tests, con extrema precaución
+#
+# PREREQUISITOS:
+#   - secrets.STAGING_URL          → URL del entorno de staging
+#   - secrets.PREVIEW_URL          → URL del entorno preview (si aplica)
+#   - secrets.E2E_TEST_USER        → Usuario de prueba en el entorno
+#   - secrets.E2E_TEST_PASSWORD    → Contraseña del usuario de prueba
+#   - secrets.SLACK_WEBHOOK_URL    → Para notificaciones
+#   - secrets.CYPRESS_RECORD_KEY   → Para Cypress Dashboard (opcional)
+#   - vars.E2E_FRAMEWORK           → Herramienta: "playwright" | "cypress" | "selenium"
+# =============================================================================
+
+name: "🎭 End-to-End Tests"
+
+on:
+  # -------------------------------------------------------------------------
+  # ACTIVACIÓN MANUAL: para ejecutar bajo demanda antes de un release
+  # -------------------------------------------------------------------------
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno objetivo de las pruebas"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - preview
+          - production
+
+      base_url:
+        description: |
+          URL base del entorno (dejar vacío para usar la del Environment configurado)
+          Ej: https://mi-app.staging.example.com
+        required: false
+        type: string
+
+      test_suite:
+        description: |
+          Suite de pruebas a ejecutar:
+          • smoke      → Tests críticos rápidos (5-10 min)
+          • regression → Suite de regresión completa (30-60 min)
+          • full       → Todos los tests sin filtro (60-120 min)
+          • custom     → Usar extra_args para especificar el grep/spec
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - regression
+          - full
+          - custom
+
+      browser:
+        description: "Navegador(es) a usar (solo aplica para Playwright y Selenium)"
+        required: false
+        default: "chromium"
+        type: choice
+        options:
+          - chromium
+          - firefox
+          - webkit
+          - all
+
+      parallel_workers:
+        description: "Número de workers paralelos (Playwright/Cypress)"
+        required: false
+        default: "4"
+        type: string
+
+      create_preview_env:
+        description: "Levantar entorno preview efímero con Docker Compose antes de las pruebas"
+        required: false
+        default: false
+        type: boolean
+
+      extra_args:
+        description: |
+          Argumentos adicionales para el runner de pruebas
+          Playwright: --grep "checkout|login" --reporter=list
+          Cypress: --spec "cypress/e2e/checkout/**/*"
+        required: false
+        type: string
+
+      notify_on_failure:
+        description: "Notificar a Slack si las pruebas fallan"
+        required: false
+        default: true
+        type: boolean
+
+  # -------------------------------------------------------------------------
+  # ACTIVACIÓN POR LABEL EN PR
+  # Cuando se añade la etiqueta 'run-e2e' a un PR, ejecuta smoke tests
+  # contra el entorno de staging (sin levantar preview para no ralentizar)
+  # -------------------------------------------------------------------------
+  pull_request:
+    types:
+      - labeled    # Cuando se añade un label
+
+  # -------------------------------------------------------------------------
+  # ACTIVACIÓN POR COMENTARIO EN PR (slash command)
+  # Un miembro del equipo puede escribir "/e2e" en un comentario del PR
+  # para disparar las pruebas E2E sin añadir un label manualmente.
+  # -------------------------------------------------------------------------
+  issue_comment:
+    types:
+      - created
+
+  # -------------------------------------------------------------------------
+  # SCHEDULE: Suite nocturna completa contra staging
+  # Se ejecuta cuando el equipo no está trabajando para no interferir
+  # -------------------------------------------------------------------------
+  # schedule:
+  #   - cron: "0 3 * * *"   # Cada día a las 03:00 UTC (nocturno)
+  #   - cron: "0 3 * * 1"   # Solo lunes (para proyectos con menor frecuencia)
+
+  # -------------------------------------------------------------------------
+  # LLAMADA DESDE OTRO WORKFLOW (reusable workflow)
+  # Permite que release-on-demand.yml llame este workflow antes de producción
+  # -------------------------------------------------------------------------
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        default: "staging"
+        type: string
+      test_suite:
+        required: false
+        default: "smoke"
+        type: string
+      base_url:
+        required: false
+        default: ""
+        type: string
+    secrets:
+      E2E_TEST_USER:
+        required: false
+      E2E_TEST_PASSWORD:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+# =============================================================================
+# PERMISOS — Principio de menor privilegio
+# =============================================================================
+permissions:
+  contents: read
+  id-token: write      # OIDC para autenticación en cloud (si se necesita)
+  pull-requests: write # Comentar resultados en PRs
+  checks: write        # Publicar resultados de tests como checks de GitHub
+
+# =============================================================================
+# CONCURRENCIA
+# En PRs: cancelar runs anteriores del mismo PR para no acumular runs obsoletos
+# En workflow_dispatch: nunca cancelar (el usuario lo ejecutó intencionalmente)
+# =============================================================================
+concurrency:
+  group: e2e-${{ github.ref }}-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+# =============================================================================
+# VARIABLES GLOBALES
+# =============================================================================
+env:
+  # Framework de testing (se puede sobreescribir con vars de repositorio)
+  E2E_FRAMEWORK: ${{ vars.E2E_FRAMEWORK || 'playwright' }}
+  # Número de reintentos para tests inestables (flaky tests)
+  E2E_RETRIES: ${{ vars.E2E_RETRIES || '2' }}
+  # Timeout máximo por test individual (en milisegundos)
+  E2E_TIMEOUT_MS: ${{ vars.E2E_TIMEOUT_MS || '30000' }}
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+
+  # ===========================================================================
+  # JOB PRELIMINAR: Validar que debe ejecutarse
+  # Gestiona la lógica de los diferentes triggers
+  # ===========================================================================
+  should-run:
+    name: "✅ Verificar condiciones de ejecución"
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+      environment: ${{ steps.check.outputs.environment }}
+      test_suite: ${{ steps.check.outputs.test_suite }}
+      base_url: ${{ steps.check.outputs.base_url }}
+      browser: ${{ steps.check.outputs.browser }}
+      workers: ${{ steps.check.outputs.workers }}
+
+    steps:
+      - name: "✅ Evaluar condiciones"
+        id: check
+        run: |
+          RUN="false"
+          ENVIRONMENT="staging"
+          TEST_SUITE="smoke"
+          BASE_URL=""
+          BROWSER="chromium"
+          WORKERS="4"
+
+          EVENT="${{ github.event_name }}"
+          echo "Evento: $EVENT"
+
+          case "$EVENT" in
+            workflow_dispatch|workflow_call)
+              # Ejecución manual o llamada desde otro workflow: siempre ejecutar
+              RUN="true"
+              ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+              TEST_SUITE="${{ github.event.inputs.test_suite || 'smoke' }}"
+              BASE_URL="${{ github.event.inputs.base_url || '' }}"
+              BROWSER="${{ github.event.inputs.browser || 'chromium' }}"
+              WORKERS="${{ github.event.inputs.parallel_workers || '4' }}"
+              echo "✅ Ejecución manual/llamada — suite: $TEST_SUITE"
+              ;;
+
+            pull_request)
+              # Solo ejecutar si el PR tiene el label 'run-e2e'
+              LABELS="${{ join(github.event.pull_request.labels.*.name, ',') }}"
+              if echo "$LABELS" | grep -q "run-e2e"; then
+                RUN="true"
+                TEST_SUITE="smoke"
+                echo "✅ PR con label 'run-e2e' detectado"
+              else
+                echo "⏩ PR sin label 'run-e2e' — saltando E2E"
+              fi
+              ;;
+
+            issue_comment)
+              # Solo ejecutar si el comentario es "/e2e" y viene de un PR
+              COMMENT="${{ github.event.comment.body }}"
+              IS_PR="${{ github.event.issue.pull_request != null }}"
+              if [ "$IS_PR" = "true" ] && echo "$COMMENT" | grep -q "^/e2e"; then
+                RUN="true"
+                TEST_SUITE="smoke"
+                # Extraer suite del comentario si se especificó: "/e2e regression"
+                if echo "$COMMENT" | grep -q "^/e2e regression"; then
+                  TEST_SUITE="regression"
+                elif echo "$COMMENT" | grep -q "^/e2e full"; then
+                  TEST_SUITE="full"
+                fi
+                echo "✅ Comando /e2e detectado en comentario — suite: $TEST_SUITE"
+              else
+                echo "⏩ Comentario no es /e2e o no es un PR"
+              fi
+              ;;
+
+            schedule)
+              # Ejecución nocturna: suite completa
+              RUN="true"
+              TEST_SUITE="full"
+              echo "✅ Ejecución nocturna — suite: full"
+              ;;
+          esac
+
+          echo "run=$RUN"               >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "test_suite=$TEST_SUITE"   >> "$GITHUB_OUTPUT"
+          echo "base_url=$BASE_URL"       >> "$GITHUB_OUTPUT"
+          echo "browser=$BROWSER"         >> "$GITHUB_OUTPUT"
+          echo "workers=$WORKERS"         >> "$GITHUB_OUTPUT"
+
+  # ===========================================================================
+  # JOB PRINCIPAL: Ejecutar las pruebas E2E
+  # ===========================================================================
+  e2e-tests:
+    name: "🎭 E2E (${{ needs.should-run.outputs.test_suite }} / ${{ needs.should-run.outputs.environment }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+
+    # Heredar secretos y variables del GitHub Environment
+    environment:
+      name: ${{ needs.should-run.outputs.environment }}
+      url: ${{ needs.should-run.outputs.base_url || vars.E2E_BASE_URL }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # Shallow clone suficiente para E2E
+
+      # -----------------------------------------------------------------------
+      # PASO 2: Reaccionar al slash command con un emoji (UX del equipo)
+      # -----------------------------------------------------------------------
+      - name: "👍 Reaccionar al comentario /e2e"
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      # -----------------------------------------------------------------------
+      # PASO 3: Determinar la URL base del entorno
+      # Prioridad: input manual > variable de Environment de GitHub > variable de repo
+      # -----------------------------------------------------------------------
+      - name: "🔗 Determinar URL base del entorno"
+        id: url
+        run: |
+          # Prioridad: input manual > secret del Environment > variable del repo
+          BASE_URL="${{ needs.should-run.outputs.base_url }}"
+
+          if [ -z "$BASE_URL" ]; then
+            BASE_URL="${{ secrets.E2E_BASE_URL }}"
+          fi
+
+          if [ -z "$BASE_URL" ]; then
+            BASE_URL="${{ vars.E2E_BASE_URL }}"
+          fi
+
+          if [ -z "$BASE_URL" ]; then
+            echo "❌ No se encontró URL base. Configurar:"
+            echo "   1. Input 'base_url' en workflow_dispatch"
+            echo "   2. Secret 'E2E_BASE_URL' en el Environment de GitHub"
+            echo "   3. Variable 'E2E_BASE_URL' en el repositorio"
+            exit 1
+          fi
+
+          echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
+          echo "✅ URL base del entorno: $BASE_URL"
+
+      # -----------------------------------------------------------------------
+      # PASO 4: Levantar entorno preview efímero (opcional)
+      # Solo si create_preview_env es true — levanta la app localmente
+      # -----------------------------------------------------------------------
+      - name: "🐳 Levantar entorno preview local (Docker Compose)"
+        if: github.event.inputs.create_preview_env == 'true'
+        run: |
+          echo "🐳 Levantando stack completo con Docker Compose..."
+
+          # Asegurarse de que el docker-compose.e2e.yml existe en el repositorio
+          if [ ! -f "docker-compose.e2e.yml" ]; then
+            echo "❌ No se encontró docker-compose.e2e.yml"
+            echo "   Crea este archivo para soporte de entorno preview efímero."
+            echo "   Ver guía de implementación sección 3.1"
+            exit 1
+          fi
+
+          # Inyectar variables de entorno para la aplicación
+          export APP_VERSION="${{ github.sha }}"
+          export NODE_ENV="test"
+          export DATABASE_URL="${{ secrets.E2E_DATABASE_URL }}"
+
+          # Levantar el stack en background
+          docker compose -f docker-compose.e2e.yml up -d --wait --wait-timeout 120
+
+          echo "✅ Stack levantado. Servicios activos:"
+          docker compose -f docker-compose.e2e.yml ps
+
+          # Esperar a que la app responda
+          APP_URL="http://localhost:3000"
+          echo "Esperando disponibilidad de $APP_URL..."
+          timeout 60 bash -c "until curl -sf $APP_URL/health > /dev/null 2>&1; do sleep 3; done"
+          echo "✅ App disponible en $APP_URL"
+
+          # Sobreescribir la URL base para apuntar al entorno local
+          echo "E2E_BASE_URL_OVERRIDE=http://localhost:3000" >> "$GITHUB_ENV"
+
+      # =======================================================================
+      # SECCIÓN PLAYWRIGHT
+      # =======================================================================
+
+      - name: "⚙️ Setup Node.js (Playwright/Cypress)"
+        if: env.E2E_FRAMEWORK == 'playwright' || env.E2E_FRAMEWORK == 'cypress'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # -----------------------------------------------------------------------
+      # CACHÉ DE PLAYWRIGHT: Los navegadores pesan ~300MB cada uno
+      # Sin caché, instalarlos toma 2-3 minutos adicionales por run
+      # -----------------------------------------------------------------------
+      - name: "💾 Cache navegadores Playwright"
+        if: env.E2E_FRAMEWORK == 'playwright'
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/.cache/ms-playwright-webkit
+          # La clave incluye el hash de package-lock.json y la versión de Playwright
+          # Si cambia la versión de Playwright, se invalida la caché automáticamente
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: "📦 Instalar dependencias npm"
+        if: env.E2E_FRAMEWORK == 'playwright' || env.E2E_FRAMEWORK == 'cypress'
+        run: npm ci --prefer-offline
+
+      - name: "🎭 Instalar navegadores Playwright"
+        if: env.E2E_FRAMEWORK == 'playwright' && steps.playwright-cache.outputs.cache-hit != 'true'
+        run: |
+          BROWSER="${{ needs.should-run.outputs.browser }}"
+
+          if [ "$BROWSER" = "all" ]; then
+            # Instalar todos los navegadores con sus dependencias del SO
+            npx playwright install --with-deps
+          else
+            # Instalar solo el navegador solicitado (ahorra tiempo y espacio)
+            npx playwright install --with-deps "$BROWSER"
+          fi
+
+          echo "✅ Navegadores instalados:"
+          npx playwright --version
+
+      # -----------------------------------------------------------------------
+      # EJECUTAR PRUEBAS CON PLAYWRIGHT
+      # -----------------------------------------------------------------------
+      - name: "🎭 Ejecutar tests Playwright"
+        if: env.E2E_FRAMEWORK == 'playwright'
+        id: playwright_run
+        run: |
+          SUITE="${{ needs.should-run.outputs.test_suite }}"
+          BROWSER="${{ needs.should-run.outputs.browser }}"
+          WORKERS="${{ needs.should-run.outputs.workers }}"
+          BASE_URL="${{ env.E2E_BASE_URL_OVERRIDE || steps.url.outputs.base_url }}"
+          EXTRA="${{ github.event.inputs.extra_args || '' }}"
+
+          echo "🎭 Ejecutando Playwright:"
+          echo "   Suite:    $SUITE"
+          echo "   Browser:  $BROWSER"
+          echo "   Workers:  $WORKERS"
+          echo "   Base URL: $BASE_URL"
+
+          # Construir el grep según la suite
+          case "$SUITE" in
+            smoke)      GREP="@smoke"      ;;
+            regression) GREP="@regression" ;;
+            full)       GREP=""            ;;  # Sin filtro: todos los tests
+            custom)     GREP=""            ;;  # Usar extra_args
+          esac
+
+          # Construir el flag de proyecto (browser)
+          if [ "$BROWSER" = "all" ]; then
+            PROJECT_FLAG=""  # Ejecutar en todos los proyectos configurados
+          else
+            PROJECT_FLAG="--project=$BROWSER"
+          fi
+
+          # Construir el flag de grep
+          GREP_FLAG=""
+          if [ -n "$GREP" ]; then
+            GREP_FLAG="--grep \"$GREP\""
+          fi
+
+          # Ejecutar Playwright
+          # --retries: reintentar tests fallidos (mitiga flakiness)
+          # --reporter: múltiples reporteros simultáneos
+          # --workers: paralelismo
+          npx playwright test \
+            --config=playwright.config.ts \
+            --workers="$WORKERS" \
+            --retries="${{ env.E2E_RETRIES }}" \
+            $PROJECT_FLAG \
+            $GREP_FLAG \
+            --reporter=html,junit,github \
+            $EXTRA
+        env:
+          # Variables de entorno para los tests
+          BASE_URL: ${{ env.E2E_BASE_URL_OVERRIDE || steps.url.outputs.base_url }}
+          E2E_TEST_USER: ${{ secrets.E2E_TEST_USER }}
+          E2E_TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+          E2E_API_KEY: ${{ secrets.E2E_API_KEY }}
+          # Deshabilitar telemetría de Playwright en CI
+          PLAYWRIGHT_TELEMETRY: "false"
+          CI: "true"
+        continue-on-error: true  # Capturar el exit code manualmente para el reporte
+
+      # =======================================================================
+      # SECCIÓN CYPRESS (alternativa a Playwright)
+      # Descomenta esta sección y comenta la de Playwright si usas Cypress
+      # =======================================================================
+
+      # - name: "💾 Cache Cypress"
+      #   if: env.E2E_FRAMEWORK == 'cypress'
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: ~/.cache/Cypress
+      #     key: ${{ runner.os }}-cypress-${{ hashFiles('**/package-lock.json') }}
+
+      # - name: "🌲 Ejecutar tests Cypress"
+      #   if: env.E2E_FRAMEWORK == 'cypress'
+      #   uses: cypress-io/github-action@v6
+      #   with:
+      #     # Si la app no está desplegada, buildear y levantar el server aquí:
+      #     # build: npm run build
+      #     # start: npm start
+      #     # wait-on: http://localhost:3000
+      #     browser: ${{ needs.should-run.outputs.browser }}
+      #     spec: "cypress/e2e/${{ needs.should-run.outputs.test_suite }}/**/*"
+      #     # Para Cypress Dashboard (requiere CYPRESS_RECORD_KEY):
+      #     record: ${{ secrets.CYPRESS_RECORD_KEY != '' }}
+      #     parallel: true
+      #     group: "E2E - ${{ needs.should-run.outputs.browser }}"
+      #   env:
+      #     CYPRESS_BASE_URL: ${{ steps.url.outputs.base_url }}
+      #     CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
+      #     CYPRESS_TEST_USER: ${{ secrets.E2E_TEST_USER }}
+      #     CYPRESS_TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # =======================================================================
+      # SECCIÓN SELENIUM (alternativa para proyectos legacy)
+      # =======================================================================
+
+      # - name: "🕸️ Levantar Selenium Grid"
+      #   if: env.E2E_FRAMEWORK == 'selenium'
+      #   run: |
+      #     # Levantar el Selenium Grid con Docker Compose
+      #     docker compose -f docker-compose.selenium.yml up -d
+      #     # Esperar a que el Grid esté disponible
+      #     timeout 60 bash -c "until curl -sf http://localhost:4444/wd/hub/status; do sleep 3; done"
+      #     echo "✅ Selenium Grid disponible en http://localhost:4444"
+
+      # - name: "🕸️ Ejecutar tests Selenium"
+      #   if: env.E2E_FRAMEWORK == 'selenium'
+      #   run: |
+      #     # Para proyectos Java:
+      #     # mvn test -Dselenium.grid.url=http://localhost:4444 -Dtest.suite=${{ needs.should-run.outputs.test_suite }}
+      #     # Para Python (pytest-selenium):
+      #     # pytest tests/e2e/ --selenium-host=localhost --selenium-port=4444 -v
+      #     # Para Node.js (WebdriverIO):
+      #     # npx wdio run wdio.conf.js --suite ${{ needs.should-run.outputs.test_suite }}
+      #     echo "Configurar según tu stack de Selenium"
+
+      # -----------------------------------------------------------------------
+      # PASO: Guardar artefactos de los tests (reportes, screenshots, videos)
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar artefactos de tests"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-results-${{ needs.should-run.outputs.test_suite }}-${{ github.run_id }}
+          path: |
+            playwright-report/
+            test-results/
+            cypress/screenshots/
+            cypress/videos/
+            reports/
+          retention-days: 14  # Mantener 14 días (los videos son grandes)
+          # Para reducir el tamaño, comprimir:
+          # if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      # PASO: Publicar resultados de tests en GitHub (check con detalles)
+      # -----------------------------------------------------------------------
+      - name: "📊 Publicar resultados en GitHub"
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: "E2E Tests — ${{ needs.should-run.outputs.test_suite }}"
+          path: |
+            test-results/junit*.xml
+            playwright-report/results.xml
+          reporter: jest-junit
+          fail-on-error: false
+          # Crear un Check en GitHub con los resultados detallados
+
+      # -----------------------------------------------------------------------
+      # PASO: Comentar en el PR con el resumen de resultados
+      # -----------------------------------------------------------------------
+      - name: "💬 Comentar resultados en PR"
+        if: |
+          always() &&
+          (github.event_name == 'pull_request' ||
+           github.event_name == 'issue_comment')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const suite = '${{ needs.should-run.outputs.test_suite }}';
+            const env = '${{ needs.should-run.outputs.environment }}';
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+            const artifactUrl = runUrl + '#artifacts';
+
+            // Intentar leer el resumen de resultados
+            let summary = '';
+            try {
+              // Playwright genera results.json con el resumen
+              const results = JSON.parse(
+                fs.readFileSync('playwright-report/results.json', 'utf8')
+              );
+              const passed = results.suites?.reduce((a, s) => a + s.specs?.filter(sp => sp.ok).length, 0) || 0;
+              const failed = results.suites?.reduce((a, s) => a + s.specs?.filter(sp => !sp.ok).length, 0) || 0;
+              const total = passed + failed;
+
+              summary = `| Tests | Resultado |\n|-------|----------|\n` +
+                        `| ✅ Passed | ${passed} |\n` +
+                        `| ❌ Failed | ${failed} |\n` +
+                        `| 📊 Total | ${total} |`;
+            } catch {
+              summary = '(No se pudo leer el resumen de resultados)';
+            }
+
+            const stepResult = '${{ steps.playwright_run.outcome }}';
+            const emoji = stepResult === 'success' ? '✅' : '❌';
+            const status = stepResult === 'success' ? 'PASARON' : 'FALLARON';
+
+            const prNumber = context.payload.pull_request?.number ||
+                             context.payload.issue?.number;
+
+            if (prNumber) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `## ${emoji} E2E Tests ${status}
+
+            **Suite:** \`${suite}\` | **Entorno:** \`${env}\`
+
+            ${summary}
+
+            🔗 [Ver reporte completo](${artifactUrl})
+            🔗 [Ver logs del workflow](${runUrl})`
+              });
+            }
+
+      # -----------------------------------------------------------------------
+      # PASO: Notificar a Slack si las pruebas fallaron
+      # -----------------------------------------------------------------------
+      - name: "🔔 Notificar fallo a Slack"
+        if: |
+          failure() &&
+          github.event.inputs.notify_on_failure != 'false' &&
+          secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "❌ E2E Tests Fallaron — ${{ github.repository }}",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "Suite", "value": "${{ needs.should-run.outputs.test_suite }}", "short": true},
+                  {"title": "Entorno", "value": "${{ needs.should-run.outputs.environment }}", "short": true},
+                  {"title": "Rama", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Actor", "value": "${{ github.actor }}", "short": true},
+                  {"title": "Logs", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver workflow>", "short": false}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # -----------------------------------------------------------------------
+      # PASO: Limpiar entorno preview efímero
+      # -----------------------------------------------------------------------
+      - name: "🧹 Limpiar entorno preview (Docker Compose)"
+        if: always() && github.event.inputs.create_preview_env == 'true'
+        run: |
+          if [ -f "docker-compose.e2e.yml" ]; then
+            docker compose -f docker-compose.e2e.yml down -v --remove-orphans
+            echo "✅ Entorno preview eliminado"
+          fi
+
+      # -----------------------------------------------------------------------
+      # PASO: Propagar el fallo si las pruebas fallaron (después de guardar artefactos)
+      # El continue-on-error del step de Playwright nos permite guardar los
+      # artefactos incluso cuando las pruebas fallan. Aquí propagamos el fallo.
+      # -----------------------------------------------------------------------
+      - name: "❌ Fallar el job si las pruebas fallaron"
+        if: steps.playwright_run.outcome == 'failure'
+        run: |
+          echo "❌ Las pruebas E2E fallaron. Ver el reporte en los artefactos."
+          exit 1
+
+      # -----------------------------------------------------------------------
+      # PASO: Job Summary con estadísticas
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 🎭 E2E Tests — ${{ needs.should-run.outputs.test_suite }}
+
+          | Campo | Valor |
+          |-------|-------|
+          | Suite | \`${{ needs.should-run.outputs.test_suite }}\` |
+          | Entorno | \`${{ needs.should-run.outputs.environment }}\` |
+          | Base URL | \`${{ steps.url.outputs.base_url }}\` |
+          | Framework | \`${{ env.E2E_FRAMEWORK }}\` |
+          | Browser | \`${{ needs.should-run.outputs.browser }}\` |
+          | Workers | ${{ needs.should-run.outputs.workers }} |
+          | Retries | ${{ env.E2E_RETRIES }} |
+          | Resultado | ${{ steps.playwright_run.outcome == 'success' && '✅ PASÓ' || '❌ FALLÓ' }} |
+
+          📌 [Ver artefactos con reporte HTML y capturas](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)
+          EOF

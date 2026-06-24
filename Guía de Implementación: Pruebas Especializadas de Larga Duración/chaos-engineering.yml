@@ -1,0 +1,696 @@
+# =============================================================================
+# .github/workflows/chaos-engineering.yml
+# Experimentos de Chaos Engineering contra clústeres de Kubernetes
+# =============================================================================
+#
+# ⚠️⚠️⚠️  ADVERTENCIA CRÍTICA  ⚠️⚠️⚠️
+# =============================================================================
+# Este workflow ejecuta experimentos que DELIBERADAMENTE inyectan fallos en
+# tu infraestructura. Puede causar:
+#   - Caída de pods y servicios
+#   - Latencia artificial en la red
+#   - Consumo extremo de CPU/memoria
+#   - Interrupciones temporales del servicio
+#
+# PREREQUISITOS OBLIGATORIOS antes de usar este workflow:
+#   1. Clúster Kubernetes de STAGING dedicado (nunca compartir con producción)
+#   2. Chaos Mesh instalado: helm install chaos-mesh chaos-mesh/chaos-mesh
+#      O Litmus: kubectl apply -f https://litmuschaos.github.io/litmus/litmus-operator-v3.x.yaml
+#   3. kubeconfig del clúster de staging como secret (KUBECONFIG_STAGING)
+#   4. Comprensión del impacto esperado de cada experimento
+#   5. Mecanismo de rollback probado (el sistema puede revertir el caos)
+#   6. Monitoreo activo (Prometheus + Grafana) durante el experimento
+#   7. Plan de comunicación si el experimento se sale de control
+#
+# HERRAMIENTAS SOPORTADAS:
+#   - Chaos Mesh (recomendado): chaos-mesh.org
+#   - Litmus Chaos: litmuschaos.io
+#
+# ESTE WORKFLOW ESTÁ DESHABILITADO POR DEFECTO.
+# Para habilitarlo: eliminar el `if: false` del job principal.
+# =============================================================================
+
+name: "🌀 Chaos Engineering"
+
+on:
+  # SOLO workflow_dispatch: NUNCA schedule ni pull_request para chaos
+  # Los experimentos de caos deben ser siempre intencionales y supervisados
+  workflow_dispatch:
+    inputs:
+      experiment_type:
+        description: |
+          Tipo de experimento de caos:
+          • pod-kill      → Eliminar pods aleatoriamente (simula fallo de nodo)
+          • network-delay → Inyectar latencia en la red entre servicios
+          • cpu-stress    → Saturar CPU de un pod (simula proceso runaway)
+          • http-abort    → Abortar % de peticiones HTTP (simula errores de red)
+          • memory-stress → Consumir memoria de un pod (simula memory pressure)
+        required: true
+        type: choice
+        options:
+          - pod-kill
+          - network-delay
+          - cpu-stress
+          - http-abort
+          - memory-stress
+
+      target_namespace:
+        description: "Namespace de Kubernetes objetivo del experimento"
+        required: false
+        default: "staging"
+        type: string
+
+      target_app:
+        description: "Etiqueta 'app' del pod/deployment objetivo (ej: mi-api)"
+        required: true
+        type: string
+
+      duration:
+        description: "Duración del experimento (formato: 2m, 5m, 10m)"
+        required: false
+        default: "2m"
+        type: string
+
+      network_delay_ms:
+        description: "Latencia a inyectar en ms (solo para network-delay)"
+        required: false
+        default: "500"
+        type: string
+
+      cpu_workers:
+        description: "Número de workers de CPU stress (solo para cpu-stress)"
+        required: false
+        default: "2"
+        type: string
+
+      # -----------------------------------------------------------------------
+      # DOBLE CHECK DE SEGURIDAD: Confirmación explícita obligatoria
+      # Un usuario debe escribir exactamente este texto para proceder.
+      # Previene ejecuciones accidentales desde la UI o scripts automatizados.
+      # -----------------------------------------------------------------------
+      confirm:
+        description: |
+          ⚠️ CONFIRMACIÓN REQUERIDA: Escribe exactamente
+          'ENTIENDO-EL-IMPACTO-Y-CONFIRMO' para ejecutar el experimento.
+          Este experimento causará fallos INTENCIONADOS en staging.
+        required: true
+        type: string
+
+      run_availability_check:
+        description: "Ejecutar health checks durante el experimento para medir disponibilidad"
+        required: false
+        default: true
+        type: boolean
+
+# =============================================================================
+# PERMISOS — Los mínimos necesarios
+# =============================================================================
+permissions:
+  contents: read  # Para leer los manifiestos del experimento
+
+# =============================================================================
+# CONCURRENCIA — Solo un experimento a la vez por clúster
+# Dos experimentos simultáneos pueden generar resultados no reproducibles
+# =============================================================================
+concurrency:
+  group: chaos-engineering-${{ github.event.inputs.target_namespace }}
+  cancel-in-progress: false  # NUNCA cancelar un experimento en curso bruscamente
+
+env:
+  EXPERIMENT_TYPE: ${{ github.event.inputs.experiment_type }}
+  TARGET_NAMESPACE: ${{ github.event.inputs.target_namespace || 'staging' }}
+  TARGET_APP: ${{ github.event.inputs.target_app }}
+  DURATION: ${{ github.event.inputs.duration || '2m' }}
+
+jobs:
+
+  # ===========================================================================
+  # JOB 0: VALIDACIÓN DE SEGURIDAD
+  # ===========================================================================
+  safety-check:
+    name: "🛡️ Safety Check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+
+    steps:
+      - name: "🛡️ Validar confirmación y permisos"
+        id: check
+        run: |
+          CONFIRM="${{ github.event.inputs.confirm }}"
+          EXPECTED="ENTIENDO-EL-IMPACTO-Y-CONFIRMO"
+          NAMESPACE="${{ github.event.inputs.target_namespace }}"
+
+          echo "============================================"
+          echo "🌀 CHAOS ENGINEERING SAFETY CHECK"
+          echo "   Experimento: ${{ github.event.inputs.experiment_type }}"
+          echo "   Namespace:   $NAMESPACE"
+          echo "   App target:  ${{ github.event.inputs.target_app }}"
+          echo "   Duración:    ${{ github.event.inputs.duration }}"
+          echo "============================================"
+
+          # Check 1: Confirmación explícita
+          if [ "$CONFIRM" != "$EXPECTED" ]; then
+            echo "❌ EXPERIMENTO BLOQUEADO: confirmación incorrecta"
+            echo "   Recibido:  '$CONFIRM'"
+            echo "   Esperado:  '$EXPECTED'"
+            echo ""
+            echo "Para proceder, escribe exactamente: $EXPECTED"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # Check 2: Nunca ejecutar contra producción
+          if [ "$NAMESPACE" = "production" ] || [ "$NAMESPACE" = "prod" ]; then
+            echo "❌ EXPERIMENTO BLOQUEADO: namespace 'production' no permitido"
+            echo "   Los experimentos de caos NUNCA deben ejecutarse en producción."
+            echo "   Usa el namespace de staging o un entorno de pruebas dedicado."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # Check 3: El secret de kubeconfig debe existir
+          if [ -z "${{ secrets.KUBECONFIG_STAGING }}" ]; then
+            echo "❌ El secret KUBECONFIG_STAGING no está configurado."
+            echo "   Ver guía sección 5.3 para instrucciones de configuración."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "✅ Todas las validaciones pasaron. Procediendo con el experimento."
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+  # ===========================================================================
+  # JOB PRINCIPAL: Ejecutar el experimento de caos
+  # ⚠️ El `if: false` deshabilita el job completamente.
+  # Eliminar esta línea solo cuando el equipo esté listo para usar chaos engineering.
+  # ===========================================================================
+  chaos-experiment:
+    name: "🌀 Experimento: ${{ github.event.inputs.experiment_type }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: safety-check
+    if: needs.safety-check.outputs.proceed == 'true' && false
+    # ↑↑↑ QUITAR EL "&& false" CUANDO ESTÉS LISTO PARA USAR ESTE WORKFLOW ↑↑↑
+
+    # Ejecutar siempre contra el entorno de staging (nunca producción)
+    environment:
+      name: staging
+
+    outputs:
+      availability_pct: ${{ steps.analyze.outputs.availability_pct }}
+      experiment_status: ${{ steps.experiment.outputs.status }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # PASO 1: Configurar kubectl con el kubeconfig del clúster de staging
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Configurar kubectl"
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          # Verificar conectividad
+          kubectl cluster-info --request-timeout=10s
+          echo "✅ kubectl configurado correctamente"
+
+          # Verificar que el namespace objetivo existe
+          if ! kubectl get namespace "${{ env.TARGET_NAMESPACE }}" > /dev/null 2>&1; then
+            echo "❌ Namespace '${{ env.TARGET_NAMESPACE }}' no existe en el clúster"
+            exit 1
+          fi
+
+          # Verificar que los pods objetivo existen
+          POD_COUNT=$(kubectl get pods -n "${{ env.TARGET_NAMESPACE }}" \
+            -l "app=${{ env.TARGET_APP }}" --no-headers 2>/dev/null | wc -l)
+
+          if [ "$POD_COUNT" -eq 0 ]; then
+            echo "❌ No se encontraron pods con label app=${{ env.TARGET_APP }}"
+            echo "   en el namespace ${{ env.TARGET_NAMESPACE }}"
+            exit 1
+          fi
+
+          echo "✅ Encontrados $POD_COUNT pod(s) con label app=${{ env.TARGET_APP }}"
+
+      # -----------------------------------------------------------------------
+      # PASO 2: Verificar estado del sistema ANTES del experimento (baseline)
+      # -----------------------------------------------------------------------
+      - name: "📊 Baseline pre-experimento"
+        id: baseline
+        run: |
+          echo "📊 Estado del sistema ANTES del experimento:"
+          kubectl get pods -n "${{ env.TARGET_NAMESPACE }}" \
+            -l "app=${{ env.TARGET_APP }}" \
+            -o wide
+
+          # Capturar la URL del servicio para health checks durante el experimento
+          SERVICE_URL=$(kubectl get service \
+            -n "${{ env.TARGET_NAMESPACE }}" \
+            -l "app=${{ env.TARGET_APP }}" \
+            -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || \
+            echo "${{ vars.STAGING_URL }}")
+
+          echo "service_url=$SERVICE_URL" >> "$GITHUB_OUTPUT"
+          echo "🎯 URL del servicio para health checks: $SERVICE_URL"
+
+          # Verificar que el servicio responde correctamente antes de empezar
+          if [ -n "$SERVICE_URL" ]; then
+            HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
+              --max-time 10 "${SERVICE_URL}/health" 2>/dev/null || echo "000")
+            echo "Estado HTTP baseline: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "⚠️ El servicio no responde con 200 ANTES del experimento"
+              echo "   Considera abortar si el sistema ya está degradado"
+              # No abortar automáticamente: puede ser un endpoint diferente
+            fi
+          fi
+
+      # -----------------------------------------------------------------------
+      # PASO 3: Crear el manifiesto del experimento de Chaos Mesh
+      # -----------------------------------------------------------------------
+      - name: "📋 Generar manifiesto del experimento"
+        id: manifest
+        run: |
+          EXPERIMENT="${{ env.EXPERIMENT_TYPE }}"
+          NAMESPACE="${{ env.TARGET_NAMESPACE }}"
+          APP="${{ env.TARGET_APP }}"
+          DURATION="${{ env.DURATION }}"
+          TIMESTAMP=$(date +%s)
+          EXPERIMENT_NAME="chaos-${EXPERIMENT}-${TIMESTAMP}"
+
+          echo "experiment_name=$EXPERIMENT_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/chaos
+
+          case "$EXPERIMENT" in
+            # -----------------------------------------------------------------
+            # POD KILL: Eliminar pods aleatoriamente
+            # Simula: fallo de nodo, OOM killer, crash del proceso
+            # Resiliencia verificada: el deployment debe recrear los pods
+            # -----------------------------------------------------------------
+            pod-kill)
+              cat > /tmp/chaos/experiment.yaml << EOF
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: PodChaos
+          metadata:
+            name: $EXPERIMENT_NAME
+            namespace: $NAMESPACE
+          spec:
+            action: pod-kill
+            mode: one                    # Matar un pod a la vez (más seguro)
+            # mode: fixed-percent        # Para matar un % de pods
+            # value: "50"               # 50% de pods
+            selector:
+              namespaces: [$NAMESPACE]
+              labelSelectors:
+                app: $APP
+            duration: $DURATION
+            scheduler:
+              cron: "@every 30s"        # Matar un pod cada 30 segundos
+          EOF
+              echo "📋 Experimento pod-kill generado"
+              ;;
+
+            # -----------------------------------------------------------------
+            # NETWORK DELAY: Inyectar latencia en la red
+            # Simula: red congestionada, latencia geográfica, problemas de CDN
+            # Resiliencia verificada: timeouts, circuit breakers, retry logic
+            # -----------------------------------------------------------------
+            network-delay)
+              DELAY_MS="${{ github.event.inputs.network_delay_ms || '500' }}"
+              cat > /tmp/chaos/experiment.yaml << EOF
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: NetworkChaos
+          metadata:
+            name: $EXPERIMENT_NAME
+            namespace: $NAMESPACE
+          spec:
+            action: delay
+            mode: all
+            selector:
+              namespaces: [$NAMESPACE]
+              labelSelectors:
+                app: $APP
+            delay:
+              latency: "${DELAY_MS}ms"
+              correlation: "25"          # 25% de correlación entre paquetes
+              jitter: "50ms"            # ±50ms de jitter
+            direction: to               # Aplica a tráfico entrante al pod
+            duration: $DURATION
+          EOF
+              echo "📋 Experimento network-delay (${DELAY_MS}ms) generado"
+              ;;
+
+            # -----------------------------------------------------------------
+            # CPU STRESS: Saturar la CPU del pod
+            # Simula: proceso con consumo excesivo de CPU, hot path en el código
+            # Resiliencia verificada: CPU throttling, autoscaling, alertas
+            # -----------------------------------------------------------------
+            cpu-stress)
+              CPU_WORKERS="${{ github.event.inputs.cpu_workers || '2' }}"
+              cat > /tmp/chaos/experiment.yaml << EOF
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: StressChaos
+          metadata:
+            name: $EXPERIMENT_NAME
+            namespace: $NAMESPACE
+          spec:
+            mode: one
+            selector:
+              namespaces: [$NAMESPACE]
+              labelSelectors:
+                app: $APP
+            stressors:
+              cpu:
+                workers: $CPU_WORKERS    # Número de goroutines de stress
+                load: 80                 # 80% de CPU (no 100% para no bloquear el pod)
+            duration: $DURATION
+          EOF
+              echo "📋 Experimento cpu-stress ($CPU_WORKERS workers) generado"
+              ;;
+
+            # -----------------------------------------------------------------
+            # HTTP ABORT: Abortar un porcentaje de peticiones HTTP
+            # Simula: errores de red intermitentes, DNS flapping
+            # Resiliencia verificada: retry logic, error handling, circuit breakers
+            # -----------------------------------------------------------------
+            http-abort)
+              cat > /tmp/chaos/experiment.yaml << EOF
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: HTTPChaos
+          metadata:
+            name: $EXPERIMENT_NAME
+            namespace: $NAMESPACE
+          spec:
+            mode: all
+            selector:
+              namespaces: [$NAMESPACE]
+              labelSelectors:
+                app: $APP
+            target: Request             # Afecta las peticiones entrantes
+            port: 8080                  # Puerto del servicio (ajustar)
+            path: "*"                   # Todas las rutas
+            method: GET                 # Solo GET (menos impactante que POST)
+            abort: true                 # Abortar la conexión (simula timeout)
+            # Para inyectar errores 500 en lugar de abortar:
+            # replace:
+            #   code: 500
+            duration: $DURATION
+          EOF
+              echo "📋 Experimento http-abort generado"
+              ;;
+
+            # -----------------------------------------------------------------
+            # MEMORY STRESS: Consumir memoria del pod
+            # Simula: memory leak, OOM, cache creciente
+            # Resiliencia verificada: OOM killer, memory limits, autoscaling
+            # -----------------------------------------------------------------
+            memory-stress)
+              cat > /tmp/chaos/experiment.yaml << EOF
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: StressChaos
+          metadata:
+            name: $EXPERIMENT_NAME
+            namespace: $NAMESPACE
+          spec:
+            mode: one
+            selector:
+              namespaces: [$NAMESPACE]
+              labelSelectors:
+                app: $APP
+            stressors:
+              memory:
+                workers: 1
+                size: "256MB"           # Consumir 256MB (ajustar a los limits del pod)
+            duration: $DURATION
+          EOF
+              echo "📋 Experimento memory-stress (256MB) generado"
+              ;;
+          esac
+
+          echo "📄 Manifiesto generado:"
+          cat /tmp/chaos/experiment.yaml
+
+      # -----------------------------------------------------------------------
+      # PASO 4: Aplicar el experimento al clúster
+      # -----------------------------------------------------------------------
+      - name: "🌀 Aplicar experimento de caos"
+        id: experiment
+        run: |
+          EXPERIMENT_NAME="${{ steps.manifest.outputs.experiment_name }}"
+
+          echo "🌀 INICIANDO EXPERIMENTO: ${{ env.EXPERIMENT_TYPE }}"
+          echo "   Target: ${{ env.TARGET_APP }} en ${{ env.TARGET_NAMESPACE }}"
+          echo "   Duración: ${{ env.DURATION }}"
+          echo ""
+
+          # Aplicar el manifiesto del experimento
+          kubectl apply -f /tmp/chaos/experiment.yaml
+
+          echo "✅ Experimento aplicado: $EXPERIMENT_NAME"
+          echo "status=running" >> "$GITHUB_OUTPUT"
+
+          # Esperar a que el experimento esté activo
+          sleep 10
+          kubectl get "${{ env.EXPERIMENT_TYPE == 'pod-kill' && 'podchaos' || env.EXPERIMENT_TYPE == 'network-delay' && 'networkchaos' || env.EXPERIMENT_TYPE == 'http-abort' && 'httpchaos' || 'stresschaos' }}" \
+            -n "${{ env.TARGET_NAMESPACE }}" \
+            "$EXPERIMENT_NAME" 2>/dev/null || true
+
+      # -----------------------------------------------------------------------
+      # PASO 5: Monitorear disponibilidad DURANTE el experimento
+      # -----------------------------------------------------------------------
+      - name: "📊 Monitorear disponibilidad durante el experimento"
+        if: github.event.inputs.run_availability_check == 'true'
+        id: monitor
+        run: |
+          SERVICE_URL="${{ steps.baseline.outputs.service_url }}"
+          DURATION="${{ env.DURATION }}"
+
+          # Convertir duración a segundos
+          if echo "$DURATION" | grep -q "m$"; then
+            SECONDS_TOTAL=$(echo "$DURATION" | sed 's/m//' | awk '{print $1 * 60}')
+          elif echo "$DURATION" | grep -q "s$"; then
+            SECONDS_TOTAL=$(echo "$DURATION" | sed 's/s//')
+          else
+            SECONDS_TOTAL=120
+          fi
+
+          echo "📊 Monitoreando disponibilidad durante ${DURATION} (${SECONDS_TOTAL}s)..."
+
+          TOTAL_CHECKS=0
+          SUCCESSFUL_CHECKS=0
+          CHECK_LOG="/tmp/chaos-availability.log"
+
+          # Loop de health checks cada 5 segundos durante toda la duración
+          END_TIME=$(($(date +%s) + SECONDS_TOTAL))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+            TIMESTAMP=$(date '+%H:%M:%S')
+
+            if [ -n "$SERVICE_URL" ]; then
+              HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
+                --max-time 5 "${SERVICE_URL}/health" 2>/dev/null || echo "000")
+
+              if [ "$HTTP_CODE" = "200" ]; then
+                SUCCESSFUL_CHECKS=$((SUCCESSFUL_CHECKS + 1))
+                echo "[$TIMESTAMP] ✅ HTTP $HTTP_CODE" | tee -a "$CHECK_LOG"
+              else
+                echo "[$TIMESTAMP] ❌ HTTP $HTTP_CODE (esperado: 200)" | tee -a "$CHECK_LOG"
+              fi
+            else
+              # Sin URL de servicio, verificar que los pods siguen existiendo
+              POD_COUNT=$(kubectl get pods -n "${{ env.TARGET_NAMESPACE }}" \
+                -l "app=${{ env.TARGET_APP }}" \
+                --field-selector=status.phase=Running \
+                --no-headers 2>/dev/null | wc -l)
+
+              if [ "$POD_COUNT" -gt 0 ]; then
+                SUCCESSFUL_CHECKS=$((SUCCESSFUL_CHECKS + 1))
+                echo "[$TIMESTAMP] ✅ $POD_COUNT pod(s) running" | tee -a "$CHECK_LOG"
+              else
+                echo "[$TIMESTAMP] ⚠️ 0 pods running" | tee -a "$CHECK_LOG"
+              fi
+            fi
+
+            sleep 5
+          done
+
+          # Calcular porcentaje de disponibilidad
+          if [ "$TOTAL_CHECKS" -gt 0 ]; then
+            AVAILABILITY=$(echo "scale=1; $SUCCESSFUL_CHECKS * 100 / $TOTAL_CHECKS" | bc)
+          else
+            AVAILABILITY="0"
+          fi
+
+          echo ""
+          echo "============================================"
+          echo "📊 RESULTADO DE DISPONIBILIDAD:"
+          echo "   Total checks:   $TOTAL_CHECKS"
+          echo "   Exitosos:       $SUCCESSFUL_CHECKS"
+          echo "   Disponibilidad: ${AVAILABILITY}%"
+          echo "============================================"
+
+          echo "availability_pct=$AVAILABILITY" >> "$GITHUB_OUTPUT"
+          echo "total_checks=$TOTAL_CHECKS"     >> "$GITHUB_OUTPUT"
+          echo "successful_checks=$SUCCESSFUL_CHECKS" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # PASO 6: Revertir el experimento (cleanup)
+      # -----------------------------------------------------------------------
+      - name: "🔄 Revertir experimento"
+        if: always()
+        id: revert
+        run: |
+          EXPERIMENT_NAME="${{ steps.manifest.outputs.experiment_name }}"
+          EXPERIMENT="${{ env.EXPERIMENT_TYPE }}"
+
+          echo "🔄 Revirtiendo experimento: $EXPERIMENT_NAME"
+
+          # Mapear tipo de experimento a tipo de recurso de Kubernetes
+          case "$EXPERIMENT" in
+            pod-kill)      RESOURCE_TYPE="podchaos" ;;
+            network-delay) RESOURCE_TYPE="networkchaos" ;;
+            cpu-stress)    RESOURCE_TYPE="stresschaos" ;;
+            memory-stress) RESOURCE_TYPE="stresschaos" ;;
+            http-abort)    RESOURCE_TYPE="httpchaos" ;;
+            *)             RESOURCE_TYPE="podchaos" ;;
+          esac
+
+          # Eliminar el experimento (Chaos Mesh revierte automáticamente los efectos)
+          kubectl delete "$RESOURCE_TYPE" \
+            -n "${{ env.TARGET_NAMESPACE }}" \
+            "$EXPERIMENT_NAME" \
+            --timeout=60s 2>/dev/null || true
+
+          echo "✅ Experimento eliminado. Los efectos del caos han sido revertidos."
+
+          # Esperar a que el sistema se estabilice
+          echo "⏳ Esperando 30s para que el sistema se estabilice..."
+          sleep 30
+
+          # Verificar que los pods están corriendo
+          echo "Estado de pods post-experimento:"
+          kubectl get pods -n "${{ env.TARGET_NAMESPACE }}" \
+            -l "app=${{ env.TARGET_APP }}" -o wide
+
+      # -----------------------------------------------------------------------
+      # PASO 7: Verificar recuperación del sistema
+      # -----------------------------------------------------------------------
+      - name: "✅ Verificar recuperación post-experimento"
+        id: analyze
+        run: |
+          SERVICE_URL="${{ steps.baseline.outputs.service_url }}"
+          AVAILABILITY="${{ steps.monitor.outputs.availability_pct || '0' }}"
+
+          echo "✅ Verificando recuperación del sistema..."
+
+          # Esperar hasta 2 minutos para que el sistema se recupere
+          RECOVERED="false"
+          for i in {1..12}; do
+            if [ -n "$SERVICE_URL" ]; then
+              HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
+                --max-time 10 "${SERVICE_URL}/health" 2>/dev/null || echo "000")
+              if [ "$HTTP_CODE" = "200" ]; then
+                RECOVERED="true"
+                echo "✅ Sistema recuperado (HTTP 200) en intento $i"
+                break
+              fi
+            else
+              POD_COUNT=$(kubectl get pods -n "${{ env.TARGET_NAMESPACE }}" \
+                -l "app=${{ env.TARGET_APP }}" \
+                --field-selector=status.phase=Running \
+                --no-headers 2>/dev/null | wc -l)
+              if [ "$POD_COUNT" -gt 0 ]; then
+                RECOVERED="true"
+                break
+              fi
+            fi
+            echo "  Intento $i/12: esperando recuperación..."
+            sleep 10
+          done
+
+          if [ "$RECOVERED" = "false" ]; then
+            echo "❌ El sistema NO se recuperó en el tiempo esperado"
+            echo "   ¡INTERVENCIÓN MANUAL REQUERIDA!"
+          fi
+
+          echo "availability_pct=$AVAILABILITY" >> "$GITHUB_OUTPUT"
+          echo "recovered=$RECOVERED"           >> "$GITHUB_OUTPUT"
+
+          # Limpiar kubeconfig sensible
+          rm -f ~/.kube/config
+
+      # -----------------------------------------------------------------------
+      # PASO 8: Guardar artefactos del experimento
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar artefactos del experimento"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "chaos-experiment-${{ github.event.inputs.experiment_type }}-${{ github.run_id }}"
+          path: |
+            /tmp/chaos/
+            /tmp/chaos-availability.log
+          retention-days: 90
+
+      # -----------------------------------------------------------------------
+      # PASO 9: Notificar resultados a Slack
+      # -----------------------------------------------------------------------
+      - name: "🔔 Notificar resultado a Slack"
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "🌀 Chaos Experiment Completado — ${{ github.repository }}",
+              "attachments": [{
+                "color": "${{ steps.analyze.outputs.recovered == 'true' && 'good' || 'danger' }}",
+                "fields": [
+                  {"title": "Experimento", "value": "${{ github.event.inputs.experiment_type }}", "short": true},
+                  {"title": "Target", "value": "${{ github.event.inputs.target_app }}", "short": true},
+                  {"title": "Disponibilidad", "value": "${{ steps.analyze.outputs.availability_pct }}%", "short": true},
+                  {"title": "Recuperación", "value": "${{ steps.analyze.outputs.recovered == 'true' && '✅ Sí' || '❌ No — INTERVENCIÓN REQUERIDA' }}", "short": true},
+                  {"title": "Duración", "value": "${{ github.event.inputs.duration }}", "short": true},
+                  {"title": "Ejecutado por", "value": "${{ github.actor }}", "short": true},
+                  {"title": "Logs", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver detalles>", "short": false}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # -----------------------------------------------------------------------
+      # Job Summary
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 🌀 Chaos Experiment — ${{ github.event.inputs.experiment_type }}
+
+          | Campo | Valor |
+          |-------|-------|
+          | Experimento | \`${{ github.event.inputs.experiment_type }}\` |
+          | Target | \`${{ github.event.inputs.target_app }}\` en \`${{ github.event.inputs.target_namespace }}\` |
+          | Duración | \`${{ github.event.inputs.duration }}\` |
+          | Ejecutado por | \`${{ github.actor }}\` |
+          | Disponibilidad durante el caos | **${{ steps.analyze.outputs.availability_pct }}%** |
+          | Recuperación post-experimento | ${{ steps.analyze.outputs.recovered == 'true' && '✅ Sí' || '❌ No' }} |
+
+          ## Interpretación
+
+          | Disponibilidad | Calificación | Acción sugerida |
+          |---------------|-------------|----------------|
+          | >99% | 🟢 Excelente | El sistema es resiliente a este tipo de fallo |
+          | 95-99% | 🟡 Buena | Revisar SLOs y alertas |
+          | 90-95% | 🟠 Mejorable | Implementar mejoras de resiliencia |
+          | <90% | 🔴 Crítica | Revisión urgente de la arquitectura |
+
+          📌 [Ver log de disponibilidad y artefactos](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)
+          EOF

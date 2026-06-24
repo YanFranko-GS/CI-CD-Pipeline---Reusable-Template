@@ -1,0 +1,610 @@
+# =============================================================================
+# .github/workflows/terraform-plan.yml
+# Plan de Terraform / OpenTofu — Módulo 7 de la Suite DevOps
+# =============================================================================
+#
+# PROPÓSITO:
+#   Ejecutar `terraform plan` para mostrar los cambios propuestos en la
+#   infraestructura SIN aplicarlos. Se dispara automáticamente en PRs que
+#   modifican archivos de IaC, y también manualmente para inspeccionar el
+#   estado actual de cualquier entorno.
+#
+# FLUJO TÍPICO:
+#   1. Desarrollador abre PR con cambios en .tf
+#   2. Este workflow ejecuta terraform plan
+#   3. El plan se comenta en el PR para revisión humana
+#   4. El plan se guarda como artefacto para ser usado por terraform-apply.yml
+#   5. Un reviewer aprueba el PR y el apply se ejecuta en el merge
+#
+# AUTENTICACIÓN:
+#   Este workflow usa EXCLUSIVELY OIDC (OpenID Connect) para autenticarse
+#   con el proveedor cloud. NUNCA usa access keys de larga duración.
+#   Ventajas de OIDC:
+#     - Tokens de corta duración (1 hora máximo)
+#     - Sin secrets que rotar periódicamente
+#     - Auditable: cada token tiene el contexto exacto del workflow
+#   Ver guía sección 2 para configurar OIDC en AWS/Azure/GCP.
+#
+# PREREQUISITOS (secrets en el GitHub Environment correspondiente):
+#   AWS:   AWS_ROLE_ARN = arn:aws:iam::123456789:role/github-actions-terraform
+#   Azure: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   GCP:   GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+#
+# VARIABLES DE REPOSITORIO:
+#   CLOUD_PROVIDER     → "aws" | "azure" | "gcp"
+#   TF_BACKEND_BUCKET  → Nombre del bucket S3/GCS para el estado
+#   TF_BACKEND_REGION  → Región del bucket de estado
+# =============================================================================
+
+name: "📋 Terraform Plan"
+
+on:
+  # Ejecutar en PRs que modifiquen archivos de Terraform
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      # Cualquier archivo de Terraform en cualquier directorio
+      - "**.tf"
+      - "**.tfvars"
+      - "**.tfvars.json"
+      - "terraform/**"
+      - "infra/**"
+      - "infrastructure/**"
+      # Ignorar README y documentación (no afectan la infraestructura)
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "**/README*"
+
+  # Activación manual para inspeccionar el plan de cualquier entorno
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno a planificar"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+      terraform_version:
+        description: |
+          Versión de Terraform a usar (dejar vacío para 'latest').
+          Ej: 1.8.5, 1.9.0
+          Para OpenTofu: usar opentofu_version abajo.
+        required: false
+        default: "latest"
+        type: string
+
+      use_opentofu:
+        description: "Usar OpenTofu en lugar de Terraform (fork open-source)"
+        required: false
+        default: false
+        type: boolean
+
+      working_directory:
+        description: "Directorio raíz de los archivos .tf"
+        required: false
+        default: "./terraform"
+        type: string
+
+      destroy_plan:
+        description: "Generar un plan de DESTRUCCIÓN (terraform plan -destroy). ¡Usar con precaución!"
+        required: false
+        default: false
+        type: boolean
+
+  # Invocado desde otro workflow (release-on-demand.yml, ci-cd.yml, etc.)
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      working_directory:
+        required: false
+        default: "./terraform"
+        type: string
+      terraform_version:
+        required: false
+        default: "latest"
+        type: string
+    outputs:
+      plan_artifact_name:
+        description: "Nombre del artefacto que contiene el plan generado"
+        value: ${{ jobs.terraform-plan.outputs.plan_artifact_name }}
+      changes_detected:
+        description: "true si el plan detectó cambios (exit code 2)"
+        value: ${{ jobs.terraform-plan.outputs.changes_detected }}
+
+# =============================================================================
+# PERMISOS — Principio de menor privilegio
+# =============================================================================
+permissions:
+  contents: read
+  id-token: write      # OBLIGATORIO para OIDC con AWS/Azure/GCP
+  pull-requests: write # Para comentar el plan en el PR
+  checks: write        # Para publicar anotaciones en el PR
+
+# =============================================================================
+# CONCURRENCIA
+# Cancelar planes anteriores del mismo PR/rama: el último plan es el relevante
+# =============================================================================
+concurrency:
+  group: tf-plan-${{ github.ref }}-${{ github.event.inputs.environment || 'pr' }}
+  cancel-in-progress: true  # En plan, cancelar runs obsoletos es seguro
+
+# =============================================================================
+# VARIABLES GLOBALES
+# =============================================================================
+env:
+  # Activar modo automatización: suprime mensiones interactivas en la salida
+  TF_IN_AUTOMATION: "true"
+  # Directorio de trabajo (puede ser sobreescrito por input)
+  TF_WORKING_DIR: ${{ github.event.inputs.working_directory || './terraform' }}
+  # Nivel de logs (DEBUG para diagnóstico, vacío para producción)
+  # TF_LOG: DEBUG
+  # Colores en la salida (desactivar para logs más limpios en CI)
+  TF_CLI_ARGS: "-no-color"
+
+jobs:
+  terraform-plan:
+    name: "📋 Plan (${{ github.event.inputs.environment || 'pr-check' }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Heredar secrets y variables del GitHub Environment
+    # Para PR checks, usar el environment 'staging' por defecto
+    environment:
+      name: ${{ github.event.inputs.environment || (github.event_name == 'pull_request' && 'staging' || 'staging') }}
+
+    outputs:
+      plan_artifact_name: ${{ steps.artifact.outputs.name }}
+      changes_detected: ${{ steps.plan.outputs.changes_detected }}
+      resources_added: ${{ steps.parse.outputs.added }}
+      resources_changed: ${{ steps.parse.outputs.changed }}
+      resources_destroyed: ${{ steps.parse.outputs.destroyed }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # PASO 1: Checkout del repositorio
+      # -----------------------------------------------------------------------
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          # Fetch completo para que terraform fmt pueda comparar todos los archivos
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # PASO 2: Setup de Terraform o OpenTofu
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Terraform"
+        if: github.event.inputs.use_opentofu != 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ github.event.inputs.terraform_version || 'latest' }}
+          # terraform_wrapper: true → permite capturar los outputs de terraform
+          # directamente como variables de step (stdout, stderr, exitcode)
+          terraform_wrapper: true
+
+      - name: "⚙️ Setup OpenTofu (alternativa)"
+        if: github.event.inputs.use_opentofu == 'true'
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ github.event.inputs.terraform_version || 'latest' }}
+          tofu_wrapper: true
+
+      # -----------------------------------------------------------------------
+      # PASO 3: Caché de plugins de Terraform
+      # Los plugins pesan varios cientos de MB; cachearlos ahorra 2-3 min
+      # -----------------------------------------------------------------------
+      - name: "💾 Cache plugins de Terraform"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIR }}/.terraform
+            ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORKING_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      # -----------------------------------------------------------------------
+      # PASO 4: Autenticación OIDC con el proveedor cloud
+      #
+      # IMPORTANTE: Solo UNO de estos bloques debe estar activo.
+      # Comentar los dos que no uses y descomentar el que aplique.
+      # Configurar la variable CLOUD_PROVIDER en el repositorio.
+      # -----------------------------------------------------------------------
+
+      # --- OPCIÓN A: AWS con OIDC ---
+      # Requiere: AWS_ROLE_ARN en el Environment de GitHub
+      # Configuración previa: Ver guía sección 2.1
+      - name: "🔐 Autenticar en AWS (OIDC)"
+        if: vars.CLOUD_PROVIDER == 'aws' || vars.CLOUD_PROVIDER == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # El ARN del rol IAM que GitHub Actions puede asumir
+          # Este rol tiene los permisos mínimos para terraform plan/apply
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          # La región por defecto para las llamadas AWS
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          # El audience debe coincidir con el configurado en el OIDC provider de AWS
+          audience: sts.amazonaws.com
+          # Duración del token: 1 hora es suficiente para terraform plan
+          role-duration-seconds: 3600
+          # Habilita la exportación de credenciales como variables de entorno
+          # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+          # (son temporales y expiran en role-duration-seconds)
+
+      # --- OPCIÓN B: Azure con OIDC (Workload Identity Federation) ---
+      # Requiere: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+      # Configuración previa: Ver guía sección 2.2
+      # - name: "🔐 Autenticar en Azure (OIDC)"
+      #   if: vars.CLOUD_PROVIDER == 'azure'
+      #   uses: azure/login@v2
+      #   with:
+      #     client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      #     tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      #     subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      #     # enable-AzPSSession: false  # No necesitamos PowerShell
+
+      # --- OPCIÓN C: GCP con Workload Identity Federation ---
+      # Requiere: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+      # Configuración previa: Ver guía sección 2.3
+      # - name: "🔐 Autenticar en GCP (OIDC)"
+      #   if: vars.CLOUD_PROVIDER == 'gcp'
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      #     service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      #     # token_format: access_token  # Para llamadas a la API de GCP
+      #     # create_credentials_file: true  # Para SDKs que usan GOOGLE_APPLICATION_CREDENTIALS
+
+      # -----------------------------------------------------------------------
+      # PASO 5: Limpiar archivos de plan anteriores
+      # Previene usar un plan stale si la caché lo trajo
+      # -----------------------------------------------------------------------
+      - name: "🧹 Limpiar planes anteriores"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          rm -f tfplan tfplan.txt tfplan.json
+          echo "✅ Directorio limpio para nuevo plan"
+
+      # -----------------------------------------------------------------------
+      # PASO 6: Terraform Init con backend dinámico
+      # El backend se configura via variables de entorno o archivos parciales
+      # para soportar múltiples entornos sin duplicar código .tf
+      # -----------------------------------------------------------------------
+      - name: "🚀 Terraform Init"
+        id: init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+
+          echo "Inicializando Terraform para entorno: $ENVIRONMENT"
+
+          # OPCIÓN A: Backend config via archivo parcial por entorno
+          # Estructura recomendada:
+          #   terraform/backends/staging.tfbackend
+          #   terraform/backends/production.tfbackend
+          BACKEND_FILE="backends/${ENVIRONMENT}.tfbackend"
+          if [ -f "$BACKEND_FILE" ]; then
+            echo "Usando backend config: $BACKEND_FILE"
+            terraform init -backend-config="$BACKEND_FILE" -input=false -reconfigure
+          else
+            # OPCIÓN B: Backend config via variables de entorno
+            # Las variables TF_BACKEND_* se configuran en el GitHub Environment
+            terraform init \
+              -backend-config="bucket=${{ vars.TF_BACKEND_BUCKET }}" \
+              -backend-config="key=${{ vars.TF_BACKEND_KEY || format('terraform/{0}.tfstate', github.event.inputs.environment || 'staging') }}" \
+              -backend-config="region=${{ vars.TF_BACKEND_REGION || 'us-east-1' }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_BACKEND_LOCK_TABLE || 'terraform-state-lock' }}" \
+              -input=false \
+              -reconfigure
+            # -reconfigure: inicializar aunque ya exista un .terraform/
+            # Importante cuando se cambia el entorno (staging → production)
+          fi
+        env:
+          # Variables de entorno para el backend de Terraform
+          # Estas son leídas automáticamente por el provider de AWS
+          AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ env.AWS_SESSION_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # PASO 7: Verificar calidad del código Terraform
+      # -----------------------------------------------------------------------
+      - name: "🔍 Terraform fmt (verificar formato)"
+        id: fmt
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          # -check: solo verificar, no modificar
+          # -recursive: verificar todos los subdirectorios
+          # -diff: mostrar las diferencias de formato
+          terraform fmt -check -recursive -diff
+        continue-on-error: true  # No bloquear el plan por problemas de formato
+
+      - name: "✅ Terraform validate"
+        id: validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          # Validar la sintaxis y configuración sin conectarse al backend
+          terraform validate -json | tee /tmp/validate-output.json
+
+          # Verificar si hay errores
+          if ! jq -e '.valid' /tmp/validate-output.json > /dev/null 2>&1; then
+            echo "❌ terraform validate falló"
+            jq '.diagnostics[] | select(.severity == "error") | .summary' /tmp/validate-output.json
+            exit 1
+          fi
+
+          echo "✅ Terraform validate: OK"
+
+      # -----------------------------------------------------------------------
+      # PASO 8: Terraform Plan
+      # -detailed-exitcode: retorna código diferente según el resultado:
+      #   0 = éxito, sin cambios
+      #   1 = error
+      #   2 = éxito, HAY cambios
+      # -----------------------------------------------------------------------
+      - name: "📋 Terraform Plan"
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+          DESTROY_FLAG=""
+
+          # Plan de destrucción (solo con confirmación explícita)
+          if [ "${{ github.event.inputs.destroy_plan }}" = "true" ]; then
+            echo "⚠️ GENERANDO PLAN DE DESTRUCCIÓN"
+            DESTROY_FLAG="-destroy"
+          fi
+
+          # Construir el path del archivo de variables por entorno
+          VAR_FILE=""
+          if [ -f "envs/${ENVIRONMENT}.tfvars" ]; then
+            VAR_FILE="-var-file=envs/${ENVIRONMENT}.tfvars"
+          elif [ -f "${ENVIRONMENT}.tfvars" ]; then
+            VAR_FILE="-var-file=${ENVIRONMENT}.tfvars"
+          fi
+
+          echo "Ejecutando plan para entorno: $ENVIRONMENT"
+          echo "Var file: ${VAR_FILE:-'(ninguno)'}"
+
+          # Ejecutar terraform plan
+          # -out=tfplan: guardar el plan binario para aplicarlo después
+          # -input=false: no pedir inputs interactivos
+          # 2>&1: capturar stderr también
+          set +e  # No salir inmediatamente si terraform falla (necesitamos el exit code)
+          terraform plan \
+            $DESTROY_FLAG \
+            $VAR_FILE \
+            -out=tfplan \
+            -detailed-exitcode \
+            -input=false \
+            2>&1 | tee /tmp/terraform-plan-output.txt
+
+          TF_EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$TF_EXIT_CODE" >> "$GITHUB_OUTPUT"
+          set -e
+
+          case $TF_EXIT_CODE in
+            0)
+              echo "✅ Plan exitoso: sin cambios detectados"
+              echo "changes_detected=false" >> "$GITHUB_OUTPUT"
+              ;;
+            2)
+              echo "📋 Plan exitoso: hay cambios pendientes"
+              echo "changes_detected=true" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "❌ Error en terraform plan"
+              exit 1
+              ;;
+          esac
+        env:
+          # Variables de entorno para el provider de Terraform
+          # (AWS_ACCESS_KEY_ID etc. ya están en el entorno por configure-aws-credentials)
+          TF_VAR_environment: ${{ github.event.inputs.environment || 'staging' }}
+
+      # -----------------------------------------------------------------------
+      # PASO 9: Parsear el output del plan para extraer métricas
+      # -----------------------------------------------------------------------
+      - name: "📊 Parsear cambios del plan"
+        id: parse
+        run: |
+          PLAN_OUTPUT="/tmp/terraform-plan-output.txt"
+
+          if [ ! -f "$PLAN_OUTPUT" ]; then
+            echo "added=0"    >> "$GITHUB_OUTPUT"
+            echo "changed=0"  >> "$GITHUB_OUTPUT"
+            echo "destroyed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extraer el resumen de cambios (última línea de estadísticas)
+          # Formato típico: "Plan: 3 to add, 2 to change, 1 to destroy."
+          SUMMARY_LINE=$(grep -E "^Plan:|^No changes" "$PLAN_OUTPUT" || echo "")
+
+          ADDED=$(echo "$SUMMARY_LINE" | grep -oP '\d+(?= to add)' || echo "0")
+          CHANGED=$(echo "$SUMMARY_LINE" | grep -oP '\d+(?= to change)' || echo "0")
+          DESTROYED=$(echo "$SUMMARY_LINE" | grep -oP '\d+(?= to destroy)' || echo "0")
+
+          echo "added=${ADDED:-0}"       >> "$GITHUB_OUTPUT"
+          echo "changed=${CHANGED:-0}"   >> "$GITHUB_OUTPUT"
+          echo "destroyed=${DESTROYED:-0}" >> "$GITHUB_OUTPUT"
+
+          echo "============================================"
+          echo "📊 Resumen del plan:"
+          echo "   ➕ Añadir:   ${ADDED:-0} recursos"
+          echo "   🔄 Cambiar:  ${CHANGED:-0} recursos"
+          echo "   🗑️ Destruir: ${DESTROYED:-0} recursos"
+          echo "============================================"
+
+          # Anotación visible en el PR si hay destrucciones
+          if [ "${DESTROYED:-0}" -gt "0" ]; then
+            echo "::warning::⚠️ Este plan destruirá ${DESTROYED} recurso(s). Revisar con cuidado."
+          fi
+
+      # -----------------------------------------------------------------------
+      # PASO 10: Guardar el plan como artefacto
+      # El plan binario se usa en terraform-apply.yml para aplicar
+      # exactamente los cambios que fueron revisados (sin re-planificar)
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar plan como artefacto"
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Nombre único que incluye el entorno y el SHA del commit
+          name: terraform-plan-${{ github.event.inputs.environment || 'staging' }}-${{ github.sha }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            /tmp/terraform-plan-output.txt
+          # Los planes tienen validez limitada; 7 días es suficiente
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: "📌 Exportar nombre del artefacto"
+        id: artifact_name
+        run: |
+          echo "name=terraform-plan-${{ github.event.inputs.environment || 'staging' }}-${{ github.sha }}" \
+            >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # PASO 11: Comentar el plan en el PR
+      # Solo se ejecuta cuando el trigger es pull_request
+      # -----------------------------------------------------------------------
+      - name: "💬 Comentar plan en el PR"
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Leer el output del plan
+            let planOutput = '';
+            try {
+              planOutput = fs.readFileSync('/tmp/terraform-plan-output.txt', 'utf8');
+              // Truncar si es muy largo (límite de GitHub: 65535 chars)
+              if (planOutput.length > 50000) {
+                planOutput = planOutput.substring(0, 50000) +
+                  '\n\n... (salida truncada — ver artefacto para plan completo)';
+              }
+            } catch (e) {
+              planOutput = '(No se pudo leer el output del plan)';
+            }
+
+            const environment = '${{ github.event.inputs.environment || 'staging' }}';
+            const added = '${{ steps.parse.outputs.added }}' || '0';
+            const changed = '${{ steps.parse.outputs.changed }}' || '0';
+            const destroyed = '${{ steps.parse.outputs.destroyed }}' || '0';
+            const changesDetected = '${{ steps.plan.outputs.changes_detected }}';
+            const fmtResult = '${{ steps.fmt.outcome }}';
+            const validateResult = '${{ steps.validate.outcome }}';
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+
+            // Emojis según el resultado
+            const statusEmoji = changesDetected === 'true' ? '📋' :
+                                 changesDetected === 'false' ? '✅' : '❌';
+            const destroyWarning = parseInt(destroyed) > 0
+              ? `\n\n> ⚠️ **ADVERTENCIA:** Este plan destruirá **${destroyed}** recurso(s). Revisar cuidadosamente antes de aprobar.`
+              : '';
+
+            const body = `## ${statusEmoji} Terraform Plan — \`${environment}\`
+
+            | Verificación | Estado |
+            |-------------|--------|
+            | 🎨 \`terraform fmt\` | ${fmtResult === 'success' ? '✅ OK' : '⚠️ Problemas de formato'} |
+            | ✅ \`terraform validate\` | ${validateResult === 'success' ? '✅ OK' : '❌ Error'} |
+            | 📋 \`terraform plan\` | ${changesDetected === 'false' ? '✅ Sin cambios' : changesDetected === 'true' ? '📋 Cambios detectados' : '❌ Error'} |
+
+            ### Resumen de cambios${destroyWarning}
+
+            | Acción | Recursos |
+            |--------|---------|
+            | ➕ Añadir | ${added} |
+            | 🔄 Cambiar | ${changed} |
+            | 🗑️ Destruir | ${destroyed} |
+
+            <details>
+            <summary>📄 Ver plan completo</summary>
+
+            \`\`\`hcl
+            ${planOutput}
+            \`\`\`
+            </details>
+
+            🔗 [Ver logs del workflow](${runUrl})
+            📦 El artefacto del plan está disponible en el workflow para ser aplicado.
+
+            > _Generado automáticamente por \`terraform-plan.yml\`. Para aplicar estos cambios, merge este PR._`;
+
+            // Buscar si ya existe un comentario de Terraform en el PR
+            // para actualizarlo en lugar de crear uno nuevo
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.find(c =>
+              c.body.includes('## 📋 Terraform Plan') ||
+              c.body.includes('## ✅ Terraform Plan') ||
+              c.body.includes('## ❌ Terraform Plan')
+            );
+
+            if (existingComment) {
+              // Actualizar el comentario existente
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: body
+              });
+              console.log('Comentario de Terraform actualizado');
+            } else {
+              // Crear nuevo comentario
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+              console.log('Nuevo comentario de Terraform creado');
+            }
+
+      # -----------------------------------------------------------------------
+      # PASO 12: Job Summary
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+          CHANGES="${{ steps.plan.outputs.changes_detected }}"
+          ADDED="${{ steps.parse.outputs.added || '0' }}"
+          CHANGED="${{ steps.parse.outputs.changed || '0' }}"
+          DESTROYED="${{ steps.parse.outputs.destroyed || '0' }}"
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 📋 Terraform Plan — $ENVIRONMENT
+
+          | Campo | Valor |
+          |-------|-------|
+          | Entorno | \`$ENVIRONMENT\` |
+          | Directorio | \`${{ env.TF_WORKING_DIR }}\` |
+          | Cambios detectados | $( [ "$CHANGES" = "true" ] && echo "✅ Sí" || echo "⬜ No" ) |
+          | fmt | ${{ steps.fmt.outcome }} |
+          | validate | ${{ steps.validate.outcome }} |
+
+          ## Resumen de cambios
+
+          | ➕ Añadir | 🔄 Cambiar | 🗑️ Destruir |
+          |-----------|-----------|------------|
+          | $ADDED | $CHANGED | $DESTROYED |
+
+          $( [ "$DESTROYED" -gt "0" ] && echo "> ⚠️ **Este plan destruye recursos. Revisar antes de aplicar.**" || true )
+
+          📦 Artefacto: \`terraform-plan-$ENVIRONMENT-${{ github.sha }}\`
+          EOF

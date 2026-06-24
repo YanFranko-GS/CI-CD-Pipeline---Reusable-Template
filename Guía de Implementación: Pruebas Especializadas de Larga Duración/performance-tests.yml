@@ -1,0 +1,806 @@
+# =============================================================================
+# .github/workflows/performance-tests.yml
+# Pruebas de carga y rendimiento: k6, JMeter, Gatling, Locust
+# =============================================================================
+#
+# PROPÓSITO:
+#   Medir y verificar el comportamiento del sistema bajo carga. Detectar
+#   regresiones de rendimiento antes de llegar a producción, verificando
+#   que métricas clave (latencia, tasa de error, throughput) no superen
+#   los umbrales definidos.
+#
+# TIPOS DE PRUEBA:
+#   smoke   → 1-2 VUs, 30s: verificar que el script funciona
+#   load    → 10-100 VUs, 5-30m: carga normal esperada
+#   stress  → Ramp up hasta el límite del sistema
+#   soak    → Carga moderada sostenida (1-4h): detectar memory leaks
+#   spike   → Pico repentino de carga: verificar escalabilidad
+#
+# ⚠️ ADVERTENCIA IMPORTANTE:
+#   Las pruebas de STRESS y SOAK contra PRODUCCIÓN pueden degradar
+#   el servicio para usuarios reales. NUNCA ejecutar sin:
+#   1. Ventana de mantenimiento acordada
+#   2. Aprobación explícita del responsable técnico
+#   3. Monitoreo activo durante la ejecución
+#   4. Plan de rollback listo
+#
+# HERRAMIENTA PRINCIPAL: k6 (Grafana Labs)
+#   - Nativa para CI/CD
+#   - Scripts en JavaScript
+#   - Thresholds declarativos
+#   - Integración con Grafana Cloud
+#
+# PREREQUISITOS:
+#   - vars.PERF_TARGET_URL       → URL del entorno de staging
+#   - secrets.K6_CLOUD_TOKEN     → Para subir resultados a Grafana Cloud (opcional)
+#   - secrets.SLACK_WEBHOOK_URL  → Para notificaciones
+#   - secrets.PERF_AUTH_TOKEN    → Token de autenticación para las peticiones
+# =============================================================================
+
+name: "⚡ Performance & Load Tests"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno objetivo"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production  # ⚠️ Solo en ventana de mantenimiento con confirm_production=true
+
+      target_url:
+        description: |
+          URL objetivo (dejar vacío para usar vars.PERF_TARGET_URL del entorno)
+          Ej: https://api.mi-app.com
+        required: false
+        type: string
+
+      test_type:
+        description: |
+          Tipo de prueba:
+          • smoke   → Verificación rápida (1 VU, 30s)
+          • load    → Carga normal (VUs configurados, duración configurada)
+          • stress  → Hasta el límite del sistema (ramp-up agresivo)
+          • soak    → Carga sostenida para detectar memory leaks (30-60 min)
+          • spike   → Pico repentino de carga
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - load
+          - stress
+          - soak
+          - spike
+
+      virtual_users:
+        description: "Número de usuarios virtuales (VUs) máximos"
+        required: false
+        default: "10"
+        type: string
+
+      duration:
+        description: |
+          Duración de la prueba (formato k6: 30s, 5m, 1h)
+          Defaults: smoke=30s, load=5m, stress=3m, soak=30m, spike=2m
+        required: false
+        default: ""
+        type: string
+
+      threshold_checks:
+        description: "Evaluar thresholds y fallar si se superan"
+        required: false
+        default: true
+        type: boolean
+
+      upload_to_cloud:
+        description: "Subir resultados a Grafana Cloud k6 (requiere K6_CLOUD_TOKEN)"
+        required: false
+        default: false
+        type: boolean
+
+      confirm_production:
+        description: |
+          ⚠️ CONFIRMACIÓN REQUERIDA para ejecutar contra producción.
+          Escribe 'CONFIRMO-PRUEBA-EN-PRODUCCION' exactamente para continuar.
+        required: false
+        default: ""
+        type: string
+
+  # Schedule comentado: pruebas de carga semanales en staging
+  # schedule:
+  #   - cron: "0 4 * * 0"   # Domingos a las 04:00 UTC (semana laboral libre)
+
+  # Reusable workflow: puede ser llamado desde release-on-demand.yml
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        default: "staging"
+        type: string
+      test_type:
+        required: false
+        default: "smoke"
+        type: string
+      target_url:
+        required: false
+        default: ""
+        type: string
+      threshold_checks:
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      PERF_AUTH_TOKEN:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  # Nunca cancelar pruebas de rendimiento en progreso:
+  # los resultados a medias no son útiles y cancelarlos bruscamente
+  # puede dejar carga residual en el sistema bajo prueba
+  group: perf-${{ github.ref }}-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+env:
+  TEST_TYPE: ${{ github.event.inputs.test_type || 'smoke' }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'staging' }}
+
+jobs:
+
+  # ===========================================================================
+  # JOB 0: VALIDACIONES DE SEGURIDAD
+  # ===========================================================================
+  validate:
+    name: "🛡️ Validar permisos y configuración"
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      proceed: ${{ steps.validate.outputs.proceed }}
+      target_url: ${{ steps.validate.outputs.target_url }}
+      duration: ${{ steps.validate.outputs.duration }}
+      vus: ${{ steps.validate.outputs.vus }}
+
+    steps:
+      - name: "🛡️ Validar seguridad y configuración"
+        id: validate
+        run: |
+          PROCEED="true"
+          ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+          TEST_TYPE="${{ github.event.inputs.test_type || 'smoke' }}"
+          VUS="${{ github.event.inputs.virtual_users || '10' }}"
+          DURATION="${{ github.event.inputs.duration || '' }}"
+
+          echo "================================================"
+          echo "⚡ Performance Test Configuration"
+          echo "   Entorno:    $ENVIRONMENT"
+          echo "   Tipo:       $TEST_TYPE"
+          echo "   VUs:        $VUS"
+          echo "================================================"
+
+          # ===================================================================
+          # VALIDACIÓN 1: Producción requiere confirmación explícita
+          # ===================================================================
+          if [ "$ENVIRONMENT" = "production" ]; then
+            CONFIRM="${{ github.event.inputs.confirm_production }}"
+            EXPECTED="CONFIRMO-PRUEBA-EN-PRODUCCION"
+
+            if [ "$CONFIRM" != "$EXPECTED" ]; then
+              echo "❌ EJECUCIÓN BLOQUEADA EN PRODUCCIÓN"
+              echo ""
+              echo "Las pruebas de rendimiento contra PRODUCCIÓN pueden impactar"
+              echo "a usuarios reales. Para proceder:"
+              echo "  1. Asegúrate de estar en una ventana de mantenimiento"
+              echo "  2. Informa al equipo (Slack, Jira)"
+              echo "  3. Ten listo el plan de rollback"
+              echo "  4. Escribe exactamente: CONFIRMO-PRUEBA-EN-PRODUCCION"
+              echo "     en el campo 'confirm_production'"
+              PROCEED="false"
+            else
+              echo "✅ Confirmación de producción recibida"
+              echo "⚠️ EJECUTANDO CONTRA PRODUCCIÓN — Monitorear activamente"
+            fi
+
+            # Nunca ejecutar stress/soak en producción sin revisión humana
+            if [ "$TEST_TYPE" = "stress" ] || [ "$TEST_TYPE" = "soak" ]; then
+              echo "❌ Los tipos 'stress' y 'soak' NUNCA deben ejecutarse en producción"
+              echo "   Usa 'smoke' o 'load' con límites conservadores."
+              PROCEED="false"
+            fi
+          fi
+
+          # ===================================================================
+          # VALIDACIÓN 2: Determinar la URL objetivo
+          # ===================================================================
+          TARGET_URL="${{ github.event.inputs.target_url }}"
+
+          if [ -z "$TARGET_URL" ]; then
+            TARGET_URL="${{ vars.PERF_TARGET_URL }}"
+          fi
+
+          if [ -z "$TARGET_URL" ]; then
+            echo "❌ No se encontró URL objetivo. Configurar:"
+            echo "   1. Input 'target_url' en workflow_dispatch"
+            echo "   2. Variable 'PERF_TARGET_URL' en el repositorio o environment"
+            PROCEED="false"
+          fi
+
+          echo "🎯 URL objetivo: $TARGET_URL"
+
+          # ===================================================================
+          # VALIDACIÓN 3: Determinar duración por defecto según tipo de test
+          # ===================================================================
+          if [ -z "$DURATION" ]; then
+            case "$TEST_TYPE" in
+              smoke)  DURATION="30s" ;;
+              load)   DURATION="5m"  ;;
+              stress) DURATION="3m"  ;;
+              soak)   DURATION="30m" ;;
+              spike)  DURATION="2m"  ;;
+              *)      DURATION="1m"  ;;
+            esac
+          fi
+
+          echo "⏱️ Duración: $DURATION"
+          echo "👥 VUs máximos: $VUS"
+
+          echo "proceed=$PROCEED"      >> "$GITHUB_OUTPUT"
+          echo "target_url=$TARGET_URL" >> "$GITHUB_OUTPUT"
+          echo "duration=$DURATION"     >> "$GITHUB_OUTPUT"
+          echo "vus=$VUS"               >> "$GITHUB_OUTPUT"
+
+  # ===========================================================================
+  # JOB PRINCIPAL: k6 Load Testing
+  # ===========================================================================
+  k6-tests:
+    name: "⚡ k6 — ${{ github.event.inputs.test_type || 'smoke' }} (${{ github.event.inputs.virtual_users || '10' }} VUs)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: validate
+    if: needs.validate.outputs.proceed == 'true'
+
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+
+    outputs:
+      p95_ms: ${{ steps.analyze.outputs.p95_ms }}
+      error_rate: ${{ steps.analyze.outputs.error_rate }}
+      rps: ${{ steps.analyze.outputs.rps }}
+      thresholds_passed: ${{ steps.analyze.outputs.thresholds_passed }}
+
+    steps:
+      - name: "📥 Checkout (scripts de prueba)"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Setup de k6
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup k6"
+        uses: grafana/setup-k6-action@v1
+        # Por defecto instala la última versión estable de k6
+        # Para una versión específica: with: k6-version: '0.50.0'
+
+      # -----------------------------------------------------------------------
+      # Generar el script de k6 si no existe en el repositorio
+      # -----------------------------------------------------------------------
+      - name: "📝 Verificar/generar script de k6"
+        id: script
+        run: |
+          TEST_TYPE="${{ github.event.inputs.test_type || 'smoke' }}"
+          SCRIPT_PATH="k6-scripts/${TEST_TYPE}.js"
+          mkdir -p k6-scripts
+
+          # Si el script existe en el repo, usarlo
+          if [ -f "$SCRIPT_PATH" ]; then
+            echo "✅ Usando script existente: $SCRIPT_PATH"
+            echo "script_path=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "⚙️ Generando script de k6 para '$TEST_TYPE'..."
+
+          # Generar scripts según el tipo de prueba
+          case "$TEST_TYPE" in
+            smoke)
+              cat > "$SCRIPT_PATH" << 'SCRIPT'
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate } from 'k6/metrics';
+
+const errorRate = new Rate('errors');
+
+export const options = {
+  // Smoke test: verificación mínima que el sistema responde
+  vus: 1,
+  duration: '30s',
+  thresholds: {
+    http_req_failed: ['rate<0.01'],       // <1% de errores
+    http_req_duration: ['p(95)<2000'],    // 95% de requests < 2s
+    errors: ['rate<0.01'],
+  },
+};
+
+export default function () {
+  const BASE_URL = __ENV.TARGET_URL;
+  const headers = __ENV.AUTH_TOKEN
+    ? { Authorization: `Bearer ${__ENV.AUTH_TOKEN}` }
+    : {};
+
+  // Health check
+  const res = http.get(`${BASE_URL}/health`, { headers });
+  const success = check(res, {
+    'status 200': (r) => r.status === 200,
+    'response time < 2s': (r) => r.timings.duration < 2000,
+    'body not empty': (r) => r.body.length > 0,
+  });
+  errorRate.add(!success);
+  sleep(1);
+}
+SCRIPT
+              ;;
+
+            load)
+              cat > "$SCRIPT_PATH" << 'SCRIPT'
+import http from 'k6/http';
+import { check, group, sleep } from 'k6';
+import { Counter, Rate, Trend } from 'k6/metrics';
+
+const errorRate = new Rate('errors');
+const pageLoadTime = new Trend('page_load_time');
+
+export const options = {
+  // Load test: carga normal esperada con ramp-up gradual
+  stages: [
+    { duration: '1m', target: 10 },   // Ramp up
+    { duration: '3m', target: 10 },   // Carga sostenida
+    { duration: '1m', target: 0 },    // Ramp down
+  ],
+  thresholds: {
+    http_req_failed: ['rate<0.05'],       // <5% de errores
+    http_req_duration: ['p(95)<3000'],    // 95% < 3s
+    http_req_duration: ['p(99)<5000'],    // 99% < 5s
+    errors: ['rate<0.05'],
+  },
+};
+
+export default function () {
+  const BASE_URL = __ENV.TARGET_URL;
+  const headers = __ENV.AUTH_TOKEN
+    ? { Authorization: `Bearer ${__ENV.AUTH_TOKEN}`, 'Content-Type': 'application/json' }
+    : { 'Content-Type': 'application/json' };
+
+  group('Flujo principal de usuario', () => {
+    // 1. Health check
+    let res = http.get(`${BASE_URL}/health`, { headers });
+    check(res, { 'health: status 200': (r) => r.status === 200 });
+
+    sleep(0.5);
+
+    // 2. Endpoint principal de API
+    res = http.get(`${BASE_URL}/api/items`, { headers });
+    const ok = check(res, {
+      'items: status 200': (r) => r.status === 200,
+      'items: response < 3s': (r) => r.timings.duration < 3000,
+    });
+    errorRate.add(!ok);
+    pageLoadTime.add(res.timings.duration);
+
+    sleep(1);
+  });
+}
+SCRIPT
+              ;;
+
+            stress)
+              cat > "$SCRIPT_PATH" << 'SCRIPT'
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  // Stress test: escalar hasta encontrar el punto de quiebre
+  stages: [
+    { duration: '30s', target: 10 },
+    { duration: '30s', target: 50 },
+    { duration: '30s', target: 100 },
+    { duration: '1m',  target: 100 },
+    { duration: '30s', target: 0 },
+  ],
+  thresholds: {
+    // En stress test, aceptamos más errores: buscamos el límite
+    http_req_failed: ['rate<0.20'],
+    http_req_duration: ['p(95)<5000'],
+  },
+};
+
+export default function () {
+  const res = http.get(`${__ENV.TARGET_URL}/health`);
+  check(res, { 'status not 5xx': (r) => r.status < 500 });
+  sleep(0.5);
+}
+SCRIPT
+              ;;
+
+            soak)
+              cat > "$SCRIPT_PATH" << 'SCRIPT'
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+// Soak test: carga moderada sostenida durante mucho tiempo
+// Objetivo: detectar memory leaks, degradación gradual, conexiones BD
+export const options = {
+  stages: [
+    { duration: '2m',  target: 20 },  // Ramp up lento
+    { duration: '25m', target: 20 },  // Carga sostenida
+    { duration: '3m',  target: 0 },   // Ramp down
+  ],
+  thresholds: {
+    http_req_failed: ['rate<0.01'],
+    http_req_duration: ['p(95)<3000'],
+    // La clave del soak test: la latencia NO debe aumentar con el tiempo
+    // Monitorear externamente en Grafana/Datadog
+  },
+};
+
+export default function () {
+  const res = http.get(`${__ENV.TARGET_URL}/api/items`);
+  check(res, {
+    'status 200': (r) => r.status === 200,
+    'response < 3s': (r) => r.timings.duration < 3000,
+  });
+  sleep(2);
+}
+SCRIPT
+              ;;
+
+            spike)
+              cat > "$SCRIPT_PATH" << 'SCRIPT'
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+// Spike test: pico repentino de carga para verificar escalabilidad automática
+export const options = {
+  stages: [
+    { duration: '10s', target: 1 },     // Baseline
+    { duration: '30s', target: 100 },   // Pico súbito
+    { duration: '1m',  target: 100 },   // Mantener el pico
+    { duration: '30s', target: 1 },     // Vuelta a baseline
+    { duration: '20s', target: 0 },     // Fin
+  ],
+  thresholds: {
+    http_req_failed: ['rate<0.10'],      // Toleramos hasta 10% de errores en el pico
+    http_req_duration: ['p(95)<5000'],
+  },
+};
+
+export default function () {
+  const res = http.get(`${__ENV.TARGET_URL}/health`);
+  check(res, { 'not 5xx': (r) => r.status < 500 });
+  sleep(1);
+}
+SCRIPT
+              ;;
+          esac
+
+          echo "✅ Script generado: $SCRIPT_PATH"
+          echo "script_path=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Ejecutar k6
+      # -----------------------------------------------------------------------
+      - name: "⚡ Ejecutar k6"
+        id: k6_run
+        run: |
+          SCRIPT="${{ steps.script.outputs.script_path }}"
+          TARGET_URL="${{ needs.validate.outputs.target_url }}"
+          VUS="${{ needs.validate.outputs.vus }}"
+          DURATION="${{ needs.validate.outputs.duration }}"
+          TEST_TYPE="${{ github.event.inputs.test_type || 'smoke' }}"
+
+          echo "⚡ Ejecutando k6:"
+          echo "   Script:  $SCRIPT"
+          echo "   URL:     $TARGET_URL"
+          echo "   VUs:     $VUS"
+          echo "   Duration: $DURATION"
+
+          # Construir los flags de k6
+          # --out json: para análisis programático después
+          # --summary-export: JSON con métricas consolidadas
+          # Si los stages están en el script, VUs y duration son ignorados
+          # Para smoke/tipos con stages en el script, no pasar --vus ni --duration
+          EXTRA_FLAGS=""
+          if [ "$TEST_TYPE" = "load" ]; then
+            EXTRA_FLAGS="--vus $VUS --duration $DURATION"
+          fi
+
+          # Ejecutar k6
+          # exit-on-running: no salir si el test sigue corriendo
+          k6 run \
+            --out json=k6-results.json \
+            --summary-export=k6-summary.json \
+            $EXTRA_FLAGS \
+            "$SCRIPT" \
+            2>&1 | tee /tmp/k6-output.txt
+
+          K6_EXIT_CODE=${PIPESTATUS[0]}
+          echo "k6_exit_code=$K6_EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "k6 exit code: $K6_EXIT_CODE (0=OK, 99=thresholds fallidos)"
+        env:
+          TARGET_URL: ${{ needs.validate.outputs.target_url }}
+          AUTH_TOKEN: ${{ secrets.PERF_AUTH_TOKEN }}
+          # Variables adicionales para los scripts:
+          API_KEY: ${{ secrets.PERF_API_KEY }}
+          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Analizar resultados y evaluar thresholds
+      # -----------------------------------------------------------------------
+      - name: "📊 Analizar resultados y thresholds"
+        id: analyze
+        run: |
+          if [ ! -f "k6-summary.json" ]; then
+            echo "⚠️ No se encontró k6-summary.json"
+            echo "p95_ms=0"          >> "$GITHUB_OUTPUT"
+            echo "error_rate=0"      >> "$GITHUB_OUTPUT"
+            echo "rps=0"             >> "$GITHUB_OUTPUT"
+            echo "thresholds_passed=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extraer métricas clave del summary JSON de k6
+          P95=$(jq '.metrics.http_req_duration.values["p(95)"] // 0' k6-summary.json 2>/dev/null || echo "0")
+          P99=$(jq '.metrics.http_req_duration.values["p(99)"] // 0' k6-summary.json 2>/dev/null || echo "0")
+          AVG=$(jq '.metrics.http_req_duration.values.avg // 0' k6-summary.json 2>/dev/null || echo "0")
+          ERROR_RATE=$(jq '(.metrics.http_req_failed.values.rate // 0) * 100' k6-summary.json 2>/dev/null || echo "0")
+          TOTAL_REQS=$(jq '.metrics.http_reqs.values.count // 0' k6-summary.json 2>/dev/null || echo "0")
+          RPS=$(jq '.metrics.http_reqs.values.rate // 0' k6-summary.json 2>/dev/null || echo "0")
+
+          # Formatear valores para legibilidad
+          P95_ROUNDED=$(echo "$P95" | awk '{printf "%.0f\n", $1}')
+          P99_ROUNDED=$(echo "$P99" | awk '{printf "%.0f\n", $1}')
+          AVG_ROUNDED=$(echo "$AVG" | awk '{printf "%.0f\n", $1}')
+          ERROR_RATE_ROUNDED=$(echo "$ERROR_RATE" | awk '{printf "%.2f\n", $1}')
+          RPS_ROUNDED=$(echo "$RPS" | awk '{printf "%.1f\n", $1}')
+
+          echo "================================================"
+          echo "📊 RESULTADOS DE PERFORMANCE:"
+          echo "   p95 latency:   ${P95_ROUNDED}ms"
+          echo "   p99 latency:   ${P99_ROUNDED}ms"
+          echo "   avg latency:   ${AVG_ROUNDED}ms"
+          echo "   error rate:    ${ERROR_RATE_ROUNDED}%"
+          echo "   total reqs:    $TOTAL_REQS"
+          echo "   req/s:         $RPS_ROUNDED"
+          echo "================================================"
+
+          # Verificar si los thresholds pasaron (exit code 99 = thresholds fallidos)
+          K6_EXIT="${{ steps.k6_run.outputs.k6_exit_code }}"
+          if [ "$K6_EXIT" = "0" ]; then
+            THRESHOLDS_PASSED="true"
+            echo "✅ Todos los thresholds pasaron"
+          elif [ "$K6_EXIT" = "99" ]; then
+            THRESHOLDS_PASSED="false"
+            echo "❌ Uno o más thresholds FALLARON"
+          else
+            THRESHOLDS_PASSED="error"
+            echo "⚠️ k6 terminó con error (exit code: $K6_EXIT)"
+          fi
+
+          echo "p95_ms=$P95_ROUNDED"               >> "$GITHUB_OUTPUT"
+          echo "p99_ms=$P99_ROUNDED"               >> "$GITHUB_OUTPUT"
+          echo "avg_ms=$AVG_ROUNDED"               >> "$GITHUB_OUTPUT"
+          echo "error_rate=$ERROR_RATE_ROUNDED"     >> "$GITHUB_OUTPUT"
+          echo "rps=$RPS_ROUNDED"                   >> "$GITHUB_OUTPUT"
+          echo "total_reqs=$TOTAL_REQS"             >> "$GITHUB_OUTPUT"
+          echo "thresholds_passed=$THRESHOLDS_PASSED" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Generar reporte HTML con k6-reporter
+      # -----------------------------------------------------------------------
+      - name: "📄 Generar reporte HTML"
+        if: always()
+        run: |
+          if [ ! -f "k6-results.json" ]; then
+            echo "⚠️ Sin datos JSON para generar reporte HTML"
+            exit 0
+          fi
+
+          # Instalar k6-reporter (generador de reportes HTML para k6)
+          npm install --no-save k6-html-reporter 2>/dev/null || true
+
+          # Generar reporte HTML si el módulo está disponible
+          if command -v node > /dev/null 2>&1; then
+            node -e "
+              try {
+                const { htmlReport } = require('k6-html-reporter');
+                const data = require('./k6-results.json');
+                htmlReport(data, { filename: 'k6-report.html' });
+                console.log('✅ Reporte HTML generado: k6-report.html');
+              } catch(e) {
+                console.log('⚠️ No se pudo generar el reporte HTML:', e.message);
+              }
+            " 2>/dev/null || true
+          fi
+
+          # Alternativa: generar un resumen HTML simple con los datos del summary
+          cat > k6-report-simple.html << EOF
+          <!DOCTYPE html>
+          <html>
+          <head><title>k6 Performance Report</title>
+          <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; }
+            .metric { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
+            .pass { border-left: 5px solid #4caf50; }
+            .fail { border-left: 5px solid #f44336; }
+            h1 { color: #333; }
+          </style>
+          </head>
+          <body>
+          <h1>⚡ k6 Performance Test Report</h1>
+          <p>Test type: <strong>${{ github.event.inputs.test_type || 'smoke' }}</strong> |
+             Target: <strong>${{ needs.validate.outputs.target_url }}</strong> |
+             Date: <strong>$(date '+%Y-%m-%d %H:%M UTC')</strong></p>
+
+          <div class="metric ${{ steps.analyze.outputs.thresholds_passed == 'true' && 'pass' || 'fail' }}">
+            <h3>🎯 Thresholds: ${{ steps.analyze.outputs.thresholds_passed == 'true' && '✅ PASSED' || '❌ FAILED' }}</h3>
+          </div>
+          <div class="metric"><h3>⏱️ p95 Latency: ${{ steps.analyze.outputs.p95_ms }}ms</h3></div>
+          <div class="metric"><h3>⏱️ p99 Latency: ${{ steps.analyze.outputs.p99_ms }}ms</h3></div>
+          <div class="metric"><h3>❌ Error Rate: ${{ steps.analyze.outputs.error_rate }}%</h3></div>
+          <div class="metric"><h3>🚀 Requests/s: ${{ steps.analyze.outputs.rps }}</h3></div>
+          <div class="metric"><h3>📊 Total Requests: ${{ steps.analyze.outputs.total_reqs }}</h3></div>
+          </body></html>
+          EOF
+
+          echo "✅ Reporte HTML simple generado"
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Guardar artefactos
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar artefactos"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "k6-results-${{ github.event.inputs.test_type || 'smoke' }}-${{ github.run_id }}"
+          path: |
+            k6-results.json
+            k6-summary.json
+            k6-report.html
+            k6-report-simple.html
+            /tmp/k6-output.txt
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # Notificación a Slack con métricas clave
+      # -----------------------------------------------------------------------
+      - name: "🔔 Notificar resultados a Slack"
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.analyze.outputs.thresholds_passed == 'true' && '✅' || '❌' }} Performance Test — ${{ github.repository }}",
+              "attachments": [{
+                "color": "${{ steps.analyze.outputs.thresholds_passed == 'true' && 'good' || 'danger' }}",
+                "fields": [
+                  {"title": "Tipo", "value": "${{ github.event.inputs.test_type || 'smoke' }}", "short": true},
+                  {"title": "Entorno", "value": "${{ github.event.inputs.environment || 'staging' }}", "short": true},
+                  {"title": "p95 latency", "value": "${{ steps.analyze.outputs.p95_ms }}ms", "short": true},
+                  {"title": "Error rate", "value": "${{ steps.analyze.outputs.error_rate }}%", "short": true},
+                  {"title": "Req/s", "value": "${{ steps.analyze.outputs.rps }}", "short": true},
+                  {"title": "Thresholds", "value": "${{ steps.analyze.outputs.thresholds_passed == 'true' && 'PASSED ✅' || 'FAILED ❌' }}", "short": true},
+                  {"title": "Logs", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver workflow>", "short": false}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # -----------------------------------------------------------------------
+      # Fallar el job si los thresholds no pasaron
+      # -----------------------------------------------------------------------
+      - name: "❌ Fallar si los thresholds no se cumplen"
+        if: |
+          github.event.inputs.threshold_checks != 'false' &&
+          steps.analyze.outputs.thresholds_passed == 'false'
+        run: |
+          echo "❌ Los thresholds de rendimiento fallaron."
+          echo "   p95 latency: ${{ steps.analyze.outputs.p95_ms }}ms"
+          echo "   error rate:  ${{ steps.analyze.outputs.error_rate }}%"
+          echo ""
+          echo "Revisar los thresholds en el script k6 y los resultados en los artefactos."
+          exit 1
+
+      # -----------------------------------------------------------------------
+      # Job Summary
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          PASSED="${{ steps.analyze.outputs.thresholds_passed }}"
+          STATUS_EMOJI="$( [ \"$PASSED\" = \"true\" ] && echo \"✅\" || echo \"❌\" )"
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # ⚡ Performance Test — ${{ github.event.inputs.test_type || 'smoke' }}
+
+          **Entorno:** ${{ github.event.inputs.environment || 'staging' }}
+          **URL:** ${{ needs.validate.outputs.target_url }}
+          **Resultado thresholds:** $STATUS_EMOJI ${{ steps.analyze.outputs.thresholds_passed }}
+
+          ## Métricas clave
+
+          | Métrica | Valor | Umbral típico |
+          |---------|-------|--------------|
+          | p95 Latency | ${{ steps.analyze.outputs.p95_ms }}ms | <3000ms |
+          | p99 Latency | ${{ steps.analyze.outputs.p99_ms }}ms | <5000ms |
+          | Avg Latency | ${{ steps.analyze.outputs.avg_ms }}ms | <1000ms |
+          | Error Rate | ${{ steps.analyze.outputs.error_rate }}% | <5% |
+          | Requests/s | ${{ steps.analyze.outputs.rps }} | - |
+          | Total Requests | ${{ steps.analyze.outputs.total_reqs }} | - |
+
+          📌 [Ver reporte completo en artefactos](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)
+          EOF
+
+  # ===========================================================================
+  # JOB ALTERNATIVO: JMeter (comentado — para equipos con JMeter existente)
+  # ===========================================================================
+  # jmeter-tests:
+  #   name: "📊 JMeter Load Tests"
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 60
+  #   needs: validate
+  #   if: needs.validate.outputs.proceed == 'true' && vars.PERF_FRAMEWORK == 'jmeter'
+  #
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     # Ejecutar JMeter en Docker (más fiable que instalar JMeter directamente)
+  #     - name: "📊 Ejecutar JMeter en Docker"
+  #       run: |
+  #         docker run --rm \
+  #           -v "$(pwd)/jmeter:/tests" \
+  #           -e "TARGET_URL=${{ needs.validate.outputs.target_url }}" \
+  #           justb4/jmeter:5.5 \
+  #           -n \
+  #           -t /tests/test-plan.jmx \
+  #           -l /tests/results.jtl \
+  #           -e \
+  #           -o /tests/report/ \
+  #           -J TARGET_URL="$TARGET_URL" \
+  #           -J VUS="${{ needs.validate.outputs.vus }}" \
+  #           -J DURATION="${{ needs.validate.outputs.duration }}"
+  #
+  #     - name: "💾 Subir reporte JMeter"
+  #       uses: actions/upload-artifact@v4
+  #       if: always()
+  #       with:
+  #         name: jmeter-report-${{ github.run_id }}
+  #         path: jmeter/report/
+  #         retention-days: 30
+  #
+  #     # Analizar el .jtl para thresholds (usando awk/python)
+  #     - name: "📊 Analizar thresholds JMeter"
+  #       run: |
+  #         # Calcular p95 desde el archivo JTL (CSV)
+  #         python3 -c "
+  #         import csv, sys
+  #         durations = []
+  #         with open('jmeter/results.jtl') as f:
+  #             for row in csv.DictReader(f):
+  #                 if row.get('success') == 'true':
+  #                     durations.append(int(row.get('elapsed', 0)))
+  #         durations.sort()
+  #         p95 = durations[int(len(durations) * 0.95)]
+  #         print(f'p95: {p95}ms')
+  #         sys.exit(0 if p95 < 3000 else 1)
+  #         "

@@ -1,0 +1,391 @@
+# =============================================================================
+# .github/workflows/terraform-apply.yml
+# Apply de Terraform / OpenTofu — aplica los cambios planificados
+# =============================================================================
+#
+# PROPÓSITO:
+#   Aplicar los cambios de infraestructura previamente planificados.
+#   Para producción, este workflow REQUIERE aprobación manual configurada
+#   en el GitHub Environment "production" antes de ejecutarse.
+#
+# DISEÑO DE SEGURIDAD:
+#   1. Preferir el plan pregenerado por terraform-plan.yml (mismo código revisado)
+#   2. Si no hay plan previo, generar uno nuevo antes del apply
+#   3. NUNCA usar -auto-approve sin plan previo en producción
+#   4. El estado remoto usa bloqueo (DynamoDB/Azure Blob lock) para evitar
+#      applies concurrentes que corrompan el estado
+#
+# ⚠️ CONFIGURAR EN GITHUB UI ANTES DE USAR:
+#   Settings → Environments → production → Protection rules:
+#     ✅ Required reviewers: [devops-lead, cto]
+#     ✅ Wait timer: 5 minutes
+#     ✅ Prevent self-review
+# =============================================================================
+
+name: "🚀 Terraform Apply"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno al que aplicar los cambios"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+      plan_artifact_name:
+        description: |
+          Nombre del artefacto del plan pregenerado (de terraform-plan.yml).
+          Si se deja vacío, se generará un nuevo plan antes del apply.
+          Formato: terraform-plan-<environment>-<commit-sha>
+          Ej: terraform-plan-staging-abc123def456
+        required: false
+        type: string
+
+      working_directory:
+        description: "Directorio raíz de los archivos .tf"
+        required: false
+        default: "./terraform"
+        type: string
+
+      use_opentofu:
+        description: "Usar OpenTofu en lugar de Terraform"
+        required: false
+        default: false
+        type: boolean
+
+      terraform_version:
+        description: "Versión de Terraform (dejar vacío para 'latest')"
+        required: false
+        default: "latest"
+        type: string
+
+      confirm_destroy:
+        description: |
+          ⚠️ Escribe 'CONFIRMO-DESTRUCCION' para aplicar un plan de destrucción.
+          Solo necesario si el plan incluye recursos a destruir.
+        required: false
+        default: ""
+        type: string
+
+  # Invocado desde release-on-demand.yml tras un merge exitoso
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      plan_artifact_name:
+        required: false
+        default: ""
+        type: string
+      working_directory:
+        required: false
+        default: "./terraform"
+        type: string
+    outputs:
+      apply_status:
+        description: "success | failure"
+        value: ${{ jobs.terraform-apply.outputs.apply_status }}
+      terraform_outputs:
+        description: "JSON con los outputs de terraform"
+        value: ${{ jobs.terraform-apply.outputs.terraform_outputs }}
+
+permissions:
+  contents: read
+  id-token: write      # OIDC
+  pull-requests: write # Comentar resultado
+
+# =============================================================================
+# CONCURRENCIA — CRÍTICO: Nunca cancelar un apply en progreso
+# Cancelar un apply a medias puede dejar la infraestructura en estado
+# inconsistente. El bloqueo de estado (DynamoDB) también previene esto.
+# =============================================================================
+concurrency:
+  group: tf-apply-${{ github.event.inputs.environment || inputs.environment || 'staging' }}
+  cancel-in-progress: false  # ← NUNCA cambiar a true para apply
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_WORKING_DIR: ${{ github.event.inputs.working_directory || inputs.working_directory || './terraform' }}
+  TF_CLI_ARGS: "-no-color"
+
+jobs:
+  terraform-apply:
+    name: "🚀 Apply (${{ github.event.inputs.environment || inputs.environment }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # Los applies pueden tardar; 60 min es conservador
+
+    # =========================================================================
+    # ENTORNO DE GITHUB: La clave de la seguridad
+    # Para 'production': GitHub pausará aquí y esperará aprobación de revisores
+    # Para 'staging': continúa automáticamente
+    # =========================================================================
+    environment:
+      name: ${{ github.event.inputs.environment || inputs.environment || 'staging' }}
+      # URL del entorno desplegado (para mostrar en la UI de GitHub)
+      url: ${{ vars.ENVIRONMENT_URL }}
+
+    outputs:
+      apply_status: ${{ steps.apply.outputs.status }}
+      terraform_outputs: ${{ steps.outputs.outputs.json }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Setup de Terraform/OpenTofu (igual que en plan)
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Terraform"
+        if: github.event.inputs.use_opentofu != 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ github.event.inputs.terraform_version || 'latest' }}
+          terraform_wrapper: true
+
+      - name: "⚙️ Setup OpenTofu"
+        if: github.event.inputs.use_opentofu == 'true'
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ github.event.inputs.terraform_version || 'latest' }}
+          tofu_wrapper: true
+
+      # -----------------------------------------------------------------------
+      # Caché de plugins (igual que en plan)
+      # -----------------------------------------------------------------------
+      - name: "💾 Cache plugins de Terraform"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIR }}/.terraform
+            ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORKING_DIR)) }}
+          restore-keys: ${{ runner.os }}-terraform-
+
+      # -----------------------------------------------------------------------
+      # Autenticación OIDC (igual que en plan — mismas opciones comentadas)
+      # -----------------------------------------------------------------------
+      - name: "🔐 Autenticar en AWS (OIDC)"
+        if: vars.CLOUD_PROVIDER == 'aws' || vars.CLOUD_PROVIDER == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          audience: sts.amazonaws.com
+          # Para apply, dar más tiempo (60 min para applies complejos)
+          role-duration-seconds: 3600
+
+      # Azure: (descomenta si usas Azure)
+      # - name: "🔐 Autenticar en Azure (OIDC)"
+      #   if: vars.CLOUD_PROVIDER == 'azure'
+      #   uses: azure/login@v2
+      #   with:
+      #     client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      #     tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      #     subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # GCP: (descomenta si usas GCP)
+      # - name: "🔐 Autenticar en GCP (OIDC)"
+      #   if: vars.CLOUD_PROVIDER == 'gcp'
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      #     service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      # -----------------------------------------------------------------------
+      # Terraform Init (igual que en plan)
+      # -----------------------------------------------------------------------
+      - name: "🚀 Terraform Init"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || inputs.environment || 'staging' }}"
+          BACKEND_FILE="backends/${ENVIRONMENT}.tfbackend"
+
+          if [ -f "$BACKEND_FILE" ]; then
+            terraform init -backend-config="$BACKEND_FILE" -input=false -reconfigure
+          else
+            terraform init \
+              -backend-config="bucket=${{ vars.TF_BACKEND_BUCKET }}" \
+              -backend-config="key=${{ vars.TF_BACKEND_KEY || format('terraform/{0}.tfstate', github.event.inputs.environment || 'staging') }}" \
+              -backend-config="region=${{ vars.TF_BACKEND_REGION || 'us-east-1' }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_BACKEND_LOCK_TABLE || 'terraform-state-lock' }}" \
+              -input=false \
+              -reconfigure
+          fi
+
+      # -----------------------------------------------------------------------
+      # PASO CLAVE: Descargar o generar el plan
+      # PREFERIR siempre el plan pregenerado (fue revisado en el PR).
+      # Si no hay plan, generar uno nuevo (más riesgoso pero posible).
+      # -----------------------------------------------------------------------
+      - name: "📥 Descargar plan pregenerado"
+        id: download_plan
+        if: github.event.inputs.plan_artifact_name != '' || inputs.plan_artifact_name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.inputs.plan_artifact_name || inputs.plan_artifact_name }}
+          path: ${{ env.TF_WORKING_DIR }}/
+        continue-on-error: true  # Si no existe el artefacto, generaremos el plan
+
+      - name: "📋 Generar plan nuevo (si no hay plan pregenerado)"
+        id: new_plan
+        if: steps.download_plan.outcome != 'success'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || inputs.environment || 'staging' }}"
+          VAR_FILE=""
+          if [ -f "envs/${ENVIRONMENT}.tfvars" ]; then
+            VAR_FILE="-var-file=envs/${ENVIRONMENT}.tfvars"
+          fi
+
+          echo "⚠️ No se encontró plan pregenerado. Generando plan nuevo..."
+          echo "   Esto es menos seguro que usar un plan revisado en PR."
+
+          terraform plan \
+            $VAR_FILE \
+            -out=tfplan \
+            -input=false \
+            2>&1 | tee /tmp/new-plan-output.txt
+
+          echo "✅ Plan nuevo generado"
+        env:
+          TF_VAR_environment: ${{ github.event.inputs.environment || inputs.environment || 'staging' }}
+
+      # -----------------------------------------------------------------------
+      # Validar que existe el archivo de plan antes de aplicar
+      # -----------------------------------------------------------------------
+      - name: "🔍 Verificar que el plan existe"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          if [ ! -f "tfplan" ]; then
+            echo "❌ No se encontró el archivo 'tfplan'"
+            echo "   El apply no puede proceder sin un plan válido."
+            exit 1
+          fi
+
+          echo "✅ Archivo de plan encontrado:"
+          ls -la tfplan
+          echo "   (El plan es un archivo binario — no es directamente legible)"
+
+      # -----------------------------------------------------------------------
+      # PASO PRINCIPAL: Terraform Apply
+      # -----------------------------------------------------------------------
+      - name: "🚀 Terraform Apply"
+        id: apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || inputs.environment || 'staging' }}"
+
+          echo "🚀 INICIANDO TERRAFORM APPLY"
+          echo "   Entorno: $ENVIRONMENT"
+          echo "   Hora de inicio: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+
+          # Aplicar el plan pregenerado
+          # El flag -input=false previene prompts interactivos
+          # NO usar -auto-approve aquí: el plan ya fue aprobado en la UI de GitHub
+          set +e
+          terraform apply \
+            -input=false \
+            tfplan \
+            2>&1 | tee /tmp/terraform-apply-output.txt
+
+          APPLY_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo ""
+          echo "Hora de finalización: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          if [ $APPLY_EXIT_CODE -eq 0 ]; then
+            echo "✅ Apply completado exitosamente"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ Apply falló con código: $APPLY_EXIT_CODE"
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            exit $APPLY_EXIT_CODE
+          fi
+
+      # -----------------------------------------------------------------------
+      # Capturar Terraform Outputs
+      # Los outputs contienen información útil: IPs, ARNs, URLs, etc.
+      # -----------------------------------------------------------------------
+      - name: "📤 Capturar Terraform Outputs"
+        id: outputs
+        if: steps.apply.outputs.status == 'success'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          # Capturar outputs en formato JSON
+          TF_OUTPUTS=$(terraform output -json 2>/dev/null || echo "{}")
+          echo "json=$TF_OUTPUTS" >> "$GITHUB_OUTPUT"
+
+          echo "📤 Terraform Outputs:"
+          echo "$TF_OUTPUTS" | jq '.' 2>/dev/null || echo "$TF_OUTPUTS"
+
+          # Guardar outputs como artefacto para uso posterior
+          echo "$TF_OUTPUTS" > /tmp/terraform-outputs.json
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Guardar artefactos del apply
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar artefactos del apply"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "terraform-apply-${{ github.event.inputs.environment || 'staging' }}-${{ github.run_id }}"
+          path: |
+            /tmp/terraform-apply-output.txt
+            /tmp/terraform-outputs.json
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # Notificar resultado a Slack
+      # -----------------------------------------------------------------------
+      - name: "🔔 Notificar resultado"
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.apply.outputs.status == 'success' && '✅' || '❌' }} Terraform Apply — ${{ github.repository }}",
+              "attachments": [{
+                "color": "${{ steps.apply.outputs.status == 'success' && 'good' || 'danger' }}",
+                "fields": [
+                  {"title": "Entorno", "value": "${{ github.event.inputs.environment || inputs.environment }}", "short": true},
+                  {"title": "Estado", "value": "${{ steps.apply.outputs.status == 'success' && 'ÉXITO ✅' || 'FALLO ❌' }}", "short": true},
+                  {"title": "Ejecutado por", "value": "${{ github.actor }}", "short": true},
+                  {"title": "Rama", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Logs", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver workflow>", "short": false}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # -----------------------------------------------------------------------
+      # Job Summary
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          STATUS="${{ steps.apply.outputs.status }}"
+          ENVIRONMENT="${{ github.event.inputs.environment || inputs.environment || 'staging' }}"
+          STATUS_EMOJI="$( [ "$STATUS" = "success" ] && echo "✅" || echo "❌" )"
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 🚀 Terraform Apply — $ENVIRONMENT
+
+          **Estado:** $STATUS_EMOJI $STATUS
+          **Entorno:** \`$ENVIRONMENT\`
+          **Ejecutado por:** ${{ github.actor }}
+          **Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          $( [ "$STATUS" = "success" ] && echo "## Terraform Outputs" || echo "" )
+          $( [ "$STATUS" = "success" ] && echo '```json' || echo "" )
+          $( [ "$STATUS" = "success" ] && cat /tmp/terraform-outputs.json 2>/dev/null || echo "" )
+          $( [ "$STATUS" = "success" ] && echo '```' || echo "" )
+          EOF

@@ -1,0 +1,459 @@
+# =============================================================================
+# .github/dependabot.yml
+# Configuración de Dependabot para actualización automática de dependencias
+# =============================================================================
+# Versión del esquema de configuración (actualmente solo existe la v2)
+version: 2
+
+# =============================================================================
+# REFERENCIA RÁPIDA DE CAMPOS COMUNES
+# -----------------------------------------------------------------------------
+# package-ecosystem  : Gestor de paquetes (npm, pip, maven, gradle, docker, etc.)
+# directory          : Dónde está el archivo de manifiesto (package.json, etc.)
+# schedule.interval  : "daily" | "weekly" | "monthly"
+# schedule.day       : (solo weekly) "monday" ... "sunday"
+# schedule.time      : Hora local en formato "HH:MM" (UTC por defecto)
+# schedule.timezone  : Timezone IANA, ej. "America/Lima"
+# open-pull-requests-limit : Máx. PRs abiertas simultáneamente (0 = deshabilitar)
+# target-branch      : Rama de destino de las PRs (default: rama por defecto del repo)
+# labels             : Etiquetas que se añaden automáticamente a cada PR
+# reviewers          : Usuarios/equipos que se añaden como revisores
+# assignees          : Usuarios asignados a la PR
+# milestone          : ID numérico del milestone a asignar
+# versioning-strategy: Cómo resolver conflictos de versión (ver detalle por ecosistema)
+# allow              : Lista blanca de dependencias a actualizar
+# ignore             : Lista de dependencias/versiones a ignorar
+# commit-message     : Prefijo y estilo del mensaje de commit (conventional commits, etc.)
+# groups             : Agrupar múltiples dependencias en una sola PR
+# =============================================================================
+
+updates:
+
+  # ===========================================================================
+  # ECOSISTEMA 1: NPM / Node.js
+  # Actualiza package.json y package-lock.json (o yarn.lock / pnpm-lock.yaml)
+  # ===========================================================================
+  - package-ecosystem: "npm"
+
+    # Directorio donde está el package.json principal.
+    # Si tu proyecto es un monorepo con múltiples package.json, puedes
+    # repetir este bloque con directorios distintos o usar "directories" (ver abajo).
+    directory: "/"
+
+    schedule:
+      # "weekly"  → Dependabot agrupa las actualizaciones y abre PRs 1 vez/semana
+      # "daily"   → Abre PRs cada día (puede saturar el equipo; úsalo solo para
+      #             proyectos de ritmo rápido o cuando quieras parches de seguridad rápido)
+      # "monthly" → Para proyectos más estables con menos rotación de deps
+      interval: "weekly"
+
+      # Día de la semana (solo aplica con interval: "weekly")
+      # Opciones: "monday" | "tuesday" | "wednesday" | "thursday" |
+      #           "friday" | "saturday" | "sunday"
+      day: "monday"
+
+      # Hora a la que se ejecuta la revisión (formato 24h, UTC por defecto)
+      time: "09:00"
+
+      # Zona horaria para la hora de schedule (recomendado especificar)
+      timezone: "America/Lima"
+
+    # Número máximo de PRs abiertas simultáneamente para este ecosistema.
+    # Si se alcanza el límite, Dependabot espera a que se cierren/mergeen
+    # antes de abrir nuevas. Evita saturar el equipo de revisión.
+    # Aumentar a 10-20 si usas auto-merge agresivo.
+    # Poner 0 para deshabilitar temporalmente sin quitar la configuración.
+    open-pull-requests-limit: 5
+
+    # Rama de destino de las PRs generadas.
+    # Por defecto usa la rama principal del repositorio (main / master).
+    # Descomenta para redirigir a una rama de integración:
+    # target-branch: "develop"
+    target-branch: "main"
+
+    # Etiquetas que se añaden automáticamente a cada PR de Dependabot.
+    # La etiqueta "automerge" es leída por el workflow auto-merge-dependabot.yml
+    # para decidir si se puede fusionar automáticamente.
+    labels:
+      - "dependencies"
+      - "npm"
+      - "automerge"
+
+    # Revisores que se añaden automáticamente a la PR.
+    # Usar handles de GitHub o slugs de equipos (org/team-slug).
+    # Descomenta si deseas asignar revisores para actualizaciones major:
+    # reviewers:
+    #   - "devops-lead"
+    #   - "mi-org/backend-team"
+
+    # Usuarios asignados (assignees) a la PR.
+    # Descomenta para activar:
+    # assignees:
+    #   - "tu-usuario"
+
+    # ID numérico del milestone al que se asociarán las PRs.
+    # Obtenlo en: github.com/<ORG>/<REPO>/milestones → la URL contiene el ID.
+    # milestone: 3
+
+    # Estrategia de versionado para resolver conflictos en package.json.
+    # "increase"       → Siempre incrementa la versión en package.json (recomendado)
+    # "increase-if-necessary" → Solo incrementa si es necesario para el lock file
+    # "lockfile-only"  → Solo actualiza el lock file, no el package.json
+    # "widen"          → Amplía el rango de versiones (ej. ^1.0.0 → ^1.0.0 || ^2.0.0)
+    versioning-strategy: increase
+
+    # -------------------------------------------------------------------------
+    # AGRUPACIÓN DE DEPENDENCIAS (groups)
+    # Reduce el número de PRs agrupando dependencias relacionadas en una sola PR.
+    # -------------------------------------------------------------------------
+    groups:
+      # Grupo para todas las dependencias de desarrollo
+      dev-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+
+      # Grupo para dependencias de producción de tipo patch/minor
+      production-minor-patch:
+        dependency-type: "production"
+        update-types:
+          - "patch"
+          - "minor"
+
+      # Grupo específico para el ecosistema de testing
+      testing-frameworks:
+        patterns:
+          - "jest*"
+          - "@testing-library/*"
+          - "vitest*"
+          - "mocha*"
+          - "chai*"
+        update-types:
+          - "minor"
+          - "patch"
+
+    # -------------------------------------------------------------------------
+    # LISTA DE DEPENDENCIAS IGNORADAS (ignore)
+    # Útil para dependencias que tienen breaking changes frecuentes,
+    # que requieren migración manual, o que están fijadas intencionalmente.
+    # -------------------------------------------------------------------------
+    # ignore:
+    #   # Ignorar TODAS las actualizaciones de una librería específica:
+    #   - dependency-name: "lodash"
+    #
+    #   # Ignorar solo actualizaciones major de una librería:
+    #   - dependency-name: "react"
+    #     update-types: ["version-update:semver-major"]
+    #
+    #   # Ignorar versiones específicas (útil cuando una versión tiene bugs):
+    #   - dependency-name: "express"
+    #     versions: ["5.0.0", "5.0.1"]
+    #
+    #   # Ignorar actualizaciones major de TODAS las dependencias:
+    #   - dependency-name: "*"
+    #     update-types: ["version-update:semver-major"]
+
+    # -------------------------------------------------------------------------
+    # LISTA BLANCA (allow) — si se define, SOLO estas deps se actualizan
+    # Útil cuando quieres un control muy estricto de qué se toca.
+    # -------------------------------------------------------------------------
+    # allow:
+    #   # Solo actualizar dependencias directas (no transitivas):
+    #   - dependency-type: "direct"
+    #   # Solo dependencias de producción:
+    #   # - dependency-type: "production"
+    #   # Solo dependencias de desarrollo:
+    #   # - dependency-type: "development"
+    #   # Solo una librería específica:
+    #   # - dependency-name: "typescript"
+
+    # -------------------------------------------------------------------------
+    # ESTILO DE MENSAJES DE COMMIT
+    # -------------------------------------------------------------------------
+    commit-message:
+      # Prefijo del mensaje (useful para conventional commits)
+      prefix: "chore"
+      # prefix-development: "chore"  # Para deps de desarrollo
+      include: "scope"  # Incluye el nombre del paquete en el scope
+
+  # ===========================================================================
+  # MONOREPO: Si tienes múltiples package.json en subdirectorios
+  # Repite el bloque npm para cada directorio relevante.
+  # ===========================================================================
+  # - package-ecosystem: "npm"
+  #   directory: "/packages/frontend"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels:
+  #     - "dependencies"
+  #     - "frontend"
+  #     - "automerge"
+  #
+  # - package-ecosystem: "npm"
+  #   directory: "/packages/backend"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels:
+  #     - "dependencies"
+  #     - "backend"
+  #     - "automerge"
+
+  # ===========================================================================
+  # ECOSISTEMA 2: PIP / Python
+  # Actualiza requirements.txt, requirements/*.txt, Pipfile, pyproject.toml
+  # ===========================================================================
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Lima"
+    open-pull-requests-limit: 5
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "python"
+      - "automerge"
+
+    # Para Python, "lockfile-only" es la estrategia más segura:
+    # evita modificar las versiones pinneadas en requirements.txt
+    # y solo actualiza el lock file generado (Pipfile.lock, etc.).
+    # Usa "increase" si quieres que Dependabot modifique requirements.txt.
+    versioning-strategy: "lockfile-only"
+
+    groups:
+      python-testing:
+        patterns:
+          - "pytest*"
+          - "coverage*"
+          - "mock*"
+        update-types: ["minor", "patch"]
+
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+    # ignore:
+    #   - dependency-name: "django"
+    #     update-types: ["version-update:semver-major"]
+
+  # ===========================================================================
+  # ECOSISTEMA 3: MAVEN / Java
+  # Actualiza pom.xml
+  # ===========================================================================
+  - package-ecosystem: "maven"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "America/Lima"
+    open-pull-requests-limit: 5
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "java"
+      - "maven"
+    # Para Maven no aplica versioning-strategy (solo existe para npm, pip, cargo)
+
+    groups:
+      spring-framework:
+        patterns:
+          - "org.springframework*"
+          - "org.springframework.boot*"
+        update-types: ["minor", "patch"]
+
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # ===========================================================================
+  # ECOSISTEMA 3b: GRADLE / Java (alternativa a Maven)
+  # Actualiza build.gradle o build.gradle.kts
+  # Descomenta y comenta el bloque maven si usas Gradle en lugar de Maven.
+  # ===========================================================================
+  # - package-ecosystem: "gradle"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #     day: "tuesday"
+  #     time: "09:00"
+  #     timezone: "America/Lima"
+  #   open-pull-requests-limit: 5
+  #   target-branch: "main"
+  #   labels:
+  #     - "dependencies"
+  #     - "java"
+  #     - "gradle"
+  #   commit-message:
+  #     prefix: "chore"
+  #     include: "scope"
+
+  # ===========================================================================
+  # ECOSISTEMA 4: DOCKER
+  # Actualiza la imagen base (FROM) en Dockerfiles.
+  # Dependabot busca Dockerfiles en el directorio especificado.
+  # IMPORTANTE: Configura un bloque por cada directorio que tenga un Dockerfile.
+  # ===========================================================================
+  - package-ecosystem: "docker"
+    # Directorio raíz: cubre el Dockerfile en la raíz del proyecto
+    directory: "/"
+    schedule:
+      # Para Docker se recomienda "weekly": las imágenes base no cambian tan frecuente
+      interval: "weekly"
+      day: "wednesday"
+      time: "09:00"
+      timezone: "America/Lima"
+    open-pull-requests-limit: 3  # Menos PRs para Docker (cambios más impactantes)
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "docker"
+      # No añadir "automerge" para Docker — requiere revisión manual
+      # porque las actualizaciones de imagen base pueden romper la build.
+
+    # reviewers:
+    #   - "devops-team"
+
+    commit-message:
+      prefix: "chore(docker)"
+      include: "scope"
+
+    # Ignorar actualizaciones major de la imagen base de Node.js
+    # (requieren migración de código):
+    # ignore:
+    #   - dependency-name: "node"
+    #     update-types: ["version-update:semver-major"]
+
+  # Segundo Dockerfile en un subdirectorio (ej. microservicio)
+  # - package-ecosystem: "docker"
+  #   directory: "/services/api"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels:
+  #     - "dependencies"
+  #     - "docker"
+
+  # ===========================================================================
+  # ECOSISTEMA 5: GO MODULES
+  # Actualiza go.mod y go.sum
+  # ===========================================================================
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:00"
+      timezone: "America/Lima"
+    open-pull-requests-limit: 5
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "go"
+      - "automerge"
+
+    groups:
+      go-minor-patch:
+        update-types: ["minor", "patch"]
+
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # ===========================================================================
+  # ECOSISTEMA 6: GITHUB ACTIONS
+  # Actualiza las versiones de las actions usadas en los workflows.
+  # MUY IMPORTANTE: Mantener las actions actualizadas evita usar versiones
+  # con vulnerabilidades de seguridad conocidas.
+  # El directorio DEBE ser ".github/workflows" (no "/").
+  # ===========================================================================
+  - package-ecosystem: "github-actions"
+    # Dependabot siempre busca en .github/workflows/ para este ecosistema.
+    # El directorio "/" es correcto aquí (Dependabot lo resuelve internamente).
+    directory: "/"
+    schedule:
+      # "weekly" es suficiente para GitHub Actions (las versiones son estables)
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/Lima"
+    # Limite bajo: las actions no cambian tan seguido y sus PRs son muy simples
+    open-pull-requests-limit: 5
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "github-actions"
+      - "automerge"  # Las actions son seguras de auto-mergear si son patch/minor
+
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"
+
+    # Ignorar actualizaciones major de actions críticas (requieren revisión):
+    # ignore:
+    #   - dependency-name: "actions/checkout"
+    #     update-types: ["version-update:semver-major"]
+
+  # ===========================================================================
+  # ECOSISTEMAS ADICIONALES (comentados — habilitar según necesidad)
+  # ===========================================================================
+
+  # CARGO (Rust)
+  # - package-ecosystem: "cargo"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels: ["dependencies", "rust", "automerge"]
+  #   versioning-strategy: "increase"
+
+  # COMPOSER (PHP)
+  # - package-ecosystem: "composer"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels: ["dependencies", "php", "automerge"]
+
+  # BUNDLER (Ruby)
+  # - package-ecosystem: "bundler"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels: ["dependencies", "ruby", "automerge"]
+
+  # NUGET (.NET / C#)
+  # - package-ecosystem: "nuget"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels: ["dependencies", "dotnet", "automerge"]
+
+  # TERRAFORM
+  # - package-ecosystem: "terraform"
+  #   directory: "/infra"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels: ["dependencies", "terraform"]
+  #   # No auto-merge para Terraform — requiere revisión y plan antes de aplicar
+
+  # HELM (Kubernetes)
+  # - package-ecosystem: "helm"
+  #   directory: "/charts"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels: ["dependencies", "helm"]
+
+  # PUB (Flutter/Dart)
+  # - package-ecosystem: "pub"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels: ["dependencies", "dart"]
+
+  # SWIFT / SWIFT PACKAGE MANAGER
+  # - package-ecosystem: "swift"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #   labels: ["dependencies", "swift"]

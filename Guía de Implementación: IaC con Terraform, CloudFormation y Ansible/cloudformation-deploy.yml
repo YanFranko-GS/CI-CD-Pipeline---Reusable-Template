@@ -1,0 +1,514 @@
+# =============================================================================
+# .github/workflows/cloudformation-deploy.yml
+# Despliegue de AWS CloudFormation / SAM
+# =============================================================================
+#
+# PROPÓSITO:
+#   Gestionar stacks de AWS CloudFormation de forma declarativa y automatizada.
+#   Soporta tres modos de operación:
+#     - deploy:    Crear o actualizar un stack (operación principal)
+#     - changeset: Solo crear el change set para revisión sin aplicar
+#     - delete:    Eliminar un stack (con confirmación explícita)
+#
+# INTEGRACIÓN SAM:
+#   Para proyectos con AWS SAM (Lambda, API Gateway), usar `sam deploy`
+#   en lugar de `aws cloudformation deploy`. Ver sección comentada.
+#
+# PREREQUISITOS:
+#   - AWS_ROLE_ARN en el GitHub Environment correspondiente
+#   - vars.AWS_REGION en el repositorio o environment
+#   - vars.CFN_S3_BUCKET: bucket S3 para subir plantillas grandes y artefactos
+# =============================================================================
+
+name: "☁️ CloudFormation Deploy"
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack_name:
+        description: "Nombre del stack de CloudFormation"
+        required: true
+        type: string
+
+      environment:
+        description: "Entorno de despliegue"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+      action:
+        description: |
+          Acción a ejecutar:
+          • deploy    → Crear o actualizar el stack (operación principal)
+          • changeset → Solo mostrar los cambios sin aplicarlos
+          • delete    → Eliminar el stack (requiere confirm_delete=true)
+        required: true
+        default: "deploy"
+        type: choice
+        options:
+          - deploy
+          - changeset
+          - delete
+
+      template_path:
+        description: "Ruta a la plantilla CloudFormation (relativa a la raíz del repo)"
+        required: false
+        default: "template.yaml"
+        type: string
+
+      parameters:
+        description: |
+          Parámetros de la plantilla en formato AWS CLI:
+          ParameterKey=Key1,ParameterValue=Value1 ParameterKey=Key2,ParameterValue=Value2
+        required: false
+        type: string
+
+      capabilities:
+        description: "Capabilities requeridas (CAPABILITY_IAM, CAPABILITY_NAMED_IAM, CAPABILITY_AUTO_EXPAND)"
+        required: false
+        default: "CAPABILITY_IAM"
+        type: string
+
+      confirm_delete:
+        description: "⚠️ Escribe 'CONFIRMO-ELIMINACION' para permitir la acción 'delete'"
+        required: false
+        default: ""
+        type: string
+
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "**.yaml"
+      - "**.yml"
+      - "cloudformation/**"
+      - "templates/**"
+      - "sam/**"
+
+  workflow_call:
+    inputs:
+      stack_name:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      action:
+        required: false
+        default: "deploy"
+        type: string
+      template_path:
+        required: false
+        default: "template.yaml"
+        type: string
+      parameters:
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: cfn-${{ github.event.inputs.stack_name || 'pr-check' }}-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: ${{ github.event.inputs.action == 'changeset' || github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  STACK_NAME: ${{ github.event.inputs.stack_name || inputs.stack_name || 'my-stack' }}
+  ACTION: ${{ github.event.inputs.action || inputs.action || 'changeset' }}
+
+jobs:
+  cloudformation:
+    name: "☁️ CFN ${{ github.event.inputs.action || 'changeset' }} — ${{ github.event.inputs.stack_name }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    environment:
+      name: ${{ github.event.inputs.environment || inputs.environment || 'staging' }}
+      url: ${{ vars.ENVIRONMENT_URL }}
+
+    outputs:
+      stack_status: ${{ steps.deploy.outputs.stack_status }}
+      stack_outputs: ${{ steps.stack_outputs.outputs.json }}
+      changeset_id: ${{ steps.changeset.outputs.changeset_id }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Autenticación AWS via OIDC
+      # -----------------------------------------------------------------------
+      - name: "🔐 Autenticar en AWS (OIDC)"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+          role-duration-seconds: 3600
+
+      # -----------------------------------------------------------------------
+      # Validar la plantilla CloudFormation
+      # -----------------------------------------------------------------------
+      - name: "✅ Validar plantilla CloudFormation"
+        id: validate
+        run: |
+          TEMPLATE="${{ github.event.inputs.template_path || inputs.template_path || 'template.yaml' }}"
+
+          if [ ! -f "$TEMPLATE" ]; then
+            echo "❌ Plantilla no encontrada: $TEMPLATE"
+            exit 1
+          fi
+
+          echo "✅ Validando: $TEMPLATE"
+
+          # aws cloudformation validate-template tiene un límite de 51200 bytes
+          # Para plantillas más grandes, subirlas a S3 primero
+          TEMPLATE_SIZE=$(wc -c < "$TEMPLATE")
+          echo "Tamaño de la plantilla: $TEMPLATE_SIZE bytes"
+
+          if [ "$TEMPLATE_SIZE" -lt 51200 ]; then
+            aws cloudformation validate-template \
+              --template-body "file://$TEMPLATE" \
+              --region "${{ env.AWS_REGION }}" \
+              2>&1
+
+            if [ $? -eq 0 ]; then
+              echo "✅ Plantilla válida"
+            else
+              echo "❌ Plantilla inválida"
+              exit 1
+            fi
+          else
+            # Para plantillas grandes, subir a S3 primero
+            echo "Plantilla grande (>51KB). Subiendo a S3 para validación..."
+            S3_BUCKET="${{ vars.CFN_S3_BUCKET }}"
+            S3_KEY="cloudformation-templates/${{ github.sha }}/$(basename $TEMPLATE)"
+
+            aws s3 cp "$TEMPLATE" "s3://${S3_BUCKET}/${S3_KEY}" --region "${{ env.AWS_REGION }}"
+            TEMPLATE_URL="https://${S3_BUCKET}.s3.${{ env.AWS_REGION }}.amazonaws.com/${S3_KEY}"
+
+            aws cloudformation validate-template \
+              --template-url "$TEMPLATE_URL" \
+              --region "${{ env.AWS_REGION }}"
+
+            echo "template_url=$TEMPLATE_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Para SAM: empacar artefactos (Lambda, Layer, etc.)
+      # Descomenta si usas AWS SAM
+      # -----------------------------------------------------------------------
+      # - name: "📦 SAM Build & Package"
+      #   if: env.ACTION == 'deploy' || env.ACTION == 'changeset'
+      #   run: |
+      #     # Instalar AWS SAM CLI
+      #     pip install aws-sam-cli
+      #
+      #     # Build: compilar las funciones Lambda
+      #     sam build --template "${{ github.event.inputs.template_path || 'template.yaml' }}"
+      #
+      #     # Package: subir artefactos a S3 y generar plantilla empaquetada
+      #     sam package \
+      #       --template-file .aws-sam/build/template.yaml \
+      #       --s3-bucket "${{ vars.CFN_S3_BUCKET }}" \
+      #       --s3-prefix "sam-artifacts/${{ github.sha }}" \
+      #       --output-template-file packaged-template.yaml \
+      #       --region "${{ env.AWS_REGION }}"
+      #
+      #     echo "TEMPLATE_PATH=packaged-template.yaml" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # ACCIÓN: CHANGESET (solo mostrar cambios, no aplicar)
+      # Ideal para PRs: muestra exactamente qué cambiaría
+      # -----------------------------------------------------------------------
+      - name: "📋 Crear Change Set"
+        id: changeset
+        if: env.ACTION == 'changeset' || github.event_name == 'pull_request'
+        run: |
+          TEMPLATE="${{ github.event.inputs.template_path || 'template.yaml' }}"
+          STACK="${{ env.STACK_NAME }}"
+          ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+          CHANGESET_NAME="github-actions-$(date +%s)"
+          PARAMS="${{ github.event.inputs.parameters || '' }}"
+
+          echo "📋 Creando change set: $CHANGESET_NAME"
+
+          # Construir el comando con parámetros opcionales
+          CFN_CMD="aws cloudformation create-change-set"
+          CFN_CMD="$CFN_CMD --stack-name $STACK"
+          CFN_CMD="$CFN_CMD --changeset-name $CHANGESET_NAME"
+          CFN_CMD="$CFN_CMD --template-body file://$TEMPLATE"
+          CFN_CMD="$CFN_CMD --capabilities ${{ github.event.inputs.capabilities || 'CAPABILITY_IAM' }}"
+          CFN_CMD="$CFN_CMD --region ${{ env.AWS_REGION }}"
+
+          if [ -n "$PARAMS" ]; then
+            CFN_CMD="$CFN_CMD --parameters $PARAMS"
+          fi
+
+          # Añadir tag de entorno
+          CFN_CMD="$CFN_CMD --tags Key=Environment,Value=$ENVIRONMENT Key=ManagedBy,Value=GitHubActions Key=CommitSHA,Value=${{ github.sha }}"
+
+          # Determinar si el stack existe o es nuevo
+          STACK_EXISTS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK" \
+            --region "${{ env.AWS_REGION }}" \
+            2>/dev/null && echo "true" || echo "false")
+
+          if [ "$STACK_EXISTS" = "false" ]; then
+            CFN_CMD="$CFN_CMD --changeset-type CREATE"
+          else
+            CFN_CMD="$CFN_CMD --changeset-type UPDATE"
+          fi
+
+          echo "Ejecutando: $CFN_CMD"
+          eval $CFN_CMD
+
+          echo "changeset_id=$CHANGESET_NAME" >> "$GITHUB_OUTPUT"
+
+          # Esperar a que el change set esté listo
+          echo "Esperando que el change set se cree..."
+          aws cloudformation wait change-set-create-complete \
+            --stack-name "$STACK" \
+            --change-set-name "$CHANGESET_NAME" \
+            --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+
+          # Obtener los detalles del change set
+          CHANGESET_DETAILS=$(aws cloudformation describe-change-set \
+            --stack-name "$STACK" \
+            --change-set-name "$CHANGESET_NAME" \
+            --region "${{ env.AWS_REGION }}" \
+            --output json)
+
+          echo "$CHANGESET_DETAILS" > /tmp/changeset-details.json
+
+          # Parsear y mostrar los cambios
+          echo ""
+          echo "📋 CAMBIOS DETECTADOS:"
+          echo "$CHANGESET_DETAILS" | jq -r '
+            .Changes[] |
+            "  \(.ResourceChange.Action) \(.ResourceChange.ResourceType) \(.ResourceChange.LogicalResourceId)"
+          ' 2>/dev/null || echo "  (No hay cambios o el formato no es reconocido)"
+
+          CHANGESET_STATUS=$(echo "$CHANGESET_DETAILS" | jq -r '.Status')
+          echo "changeset_status=$CHANGESET_STATUS" >> "$GITHUB_OUTPUT"
+
+          # Limpiar el change set si es solo para inspección (no aplicar)
+          if [ "${{ env.ACTION }}" = "changeset" ] || [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "Limpiando change set (solo era para inspección)..."
+            aws cloudformation delete-change-set \
+              --stack-name "$STACK" \
+              --change-set-name "$CHANGESET_NAME" \
+              --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+          fi
+
+      # -----------------------------------------------------------------------
+      # Comentar el change set en el PR
+      # -----------------------------------------------------------------------
+      - name: "💬 Comentar change set en PR"
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let changes = [];
+            try {
+              const details = JSON.parse(fs.readFileSync('/tmp/changeset-details.json', 'utf8'));
+              changes = details.Changes || [];
+            } catch(e) {}
+
+            const adds = changes.filter(c => c.ResourceChange.Action === 'Add').length;
+            const modifies = changes.filter(c => c.ResourceChange.Action === 'Modify').length;
+            const removes = changes.filter(c => c.ResourceChange.Action === 'Remove').length;
+
+            const changeTable = changes.map(c => {
+              const rc = c.ResourceChange;
+              const emoji = rc.Action === 'Add' ? '➕' : rc.Action === 'Remove' ? '🗑️' : '🔄';
+              return `| ${emoji} ${rc.Action} | \`${rc.ResourceType}\` | \`${rc.LogicalResourceId}\` |`;
+            }).join('\n');
+
+            const body = `## ☁️ CloudFormation Change Set — \`${{ github.event.inputs.stack_name }}\`
+
+            | ➕ Añadir | 🔄 Modificar | 🗑️ Eliminar |
+            |-----------|-------------|------------|
+            | ${adds} | ${modifies} | ${removes} |
+
+            ${ removes > 0 ? '> ⚠️ **ADVERTENCIA:** Este despliegue eliminará recursos de CloudFormation.\n' : '' }
+
+            <details>
+            <summary>📄 Ver cambios detallados</summary>
+
+            | Acción | Tipo de Recurso | ID Lógico |
+            |--------|----------------|-----------|
+            ${changeTable || '| ℹ️ | Sin cambios detectados | — |'}
+
+            </details>
+
+            🔗 [Ver logs del workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes('## ☁️ CloudFormation Change Set'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
+
+      # -----------------------------------------------------------------------
+      # ACCIÓN: DEPLOY (crear o actualizar el stack)
+      # -----------------------------------------------------------------------
+      - name: "🚀 CloudFormation Deploy"
+        id: deploy
+        if: env.ACTION == 'deploy'
+        run: |
+          TEMPLATE="${{ github.event.inputs.template_path || 'template.yaml' }}"
+          STACK="${{ env.STACK_NAME }}"
+          ENVIRONMENT="${{ github.event.inputs.environment || 'staging' }}"
+          PARAMS="${{ github.event.inputs.parameters || '' }}"
+          CAPABILITIES="${{ github.event.inputs.capabilities || 'CAPABILITY_IAM' }}"
+
+          echo "🚀 Desplegando stack: $STACK"
+          echo "   Template: $TEMPLATE"
+          echo "   Entorno:  $ENVIRONMENT"
+
+          # Construir el comando de deploy
+          DEPLOY_CMD="aws cloudformation deploy"
+          DEPLOY_CMD="$DEPLOY_CMD --template-file $TEMPLATE"
+          DEPLOY_CMD="$DEPLOY_CMD --stack-name $STACK"
+          DEPLOY_CMD="$DEPLOY_CMD --capabilities $CAPABILITIES"
+          DEPLOY_CMD="$DEPLOY_CMD --region ${{ env.AWS_REGION }}"
+          DEPLOY_CMD="$DEPLOY_CMD --no-fail-on-empty-changeset"
+          # --no-fail-on-empty-changeset: no falla si no hay cambios (idempotente)
+
+          # Añadir tags
+          DEPLOY_CMD="$DEPLOY_CMD --tags Environment=$ENVIRONMENT ManagedBy=GitHubActions CommitSHA=${{ github.sha }} GitHubRepo=${{ github.repository }}"
+
+          # Añadir parámetros si se proporcionaron
+          if [ -n "$PARAMS" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --parameter-overrides $PARAMS"
+          fi
+
+          echo "Ejecutando deploy..."
+          eval $DEPLOY_CMD 2>&1 | tee /tmp/cfn-deploy-output.txt
+
+          DEPLOY_EXIT=$?
+
+          if [ $DEPLOY_EXIT -eq 0 ]; then
+            echo "✅ Deploy completado exitosamente"
+            echo "stack_status=UPDATE_COMPLETE" >> "$GITHUB_OUTPUT"
+          else
+            # Capturar los eventos de error del stack para diagnóstico
+            echo "❌ Deploy falló. Últimos eventos del stack:"
+            aws cloudformation describe-stack-events \
+              --stack-name "$STACK" \
+              --region "${{ env.AWS_REGION }}" \
+              --query 'StackEvents[?ResourceStatus==`CREATE_FAILED` || ResourceStatus==`UPDATE_FAILED` || ResourceStatus==`ROLLBACK_IN_PROGRESS`].[Timestamp,ResourceType,LogicalResourceId,ResourceStatusReason]' \
+              --output table 2>/dev/null || true
+
+            echo "stack_status=FAILED" >> "$GITHUB_OUTPUT"
+            exit $DEPLOY_EXIT
+          fi
+
+      # -----------------------------------------------------------------------
+      # ACCIÓN: DELETE (eliminar el stack)
+      # -----------------------------------------------------------------------
+      - name: "🗑️ CloudFormation Delete Stack"
+        id: delete
+        if: env.ACTION == 'delete'
+        run: |
+          CONFIRM="${{ github.event.inputs.confirm_delete }}"
+          STACK="${{ env.STACK_NAME }}"
+
+          # Doble verificación de seguridad
+          if [ "$CONFIRM" != "CONFIRMO-ELIMINACION" ]; then
+            echo "❌ ELIMINACIÓN BLOQUEADA"
+            echo "   Para eliminar el stack, escribe 'CONFIRMO-ELIMINACION' en confirm_delete"
+            exit 1
+          fi
+
+          echo "🗑️ Eliminando stack: $STACK"
+          echo "⚠️ Esta operación es IRREVERSIBLE"
+
+          aws cloudformation delete-stack \
+            --stack-name "$STACK" \
+            --region "${{ env.AWS_REGION }}"
+
+          echo "Esperando eliminación del stack..."
+          aws cloudformation wait stack-delete-complete \
+            --stack-name "$STACK" \
+            --region "${{ env.AWS_REGION }}"
+
+          echo "✅ Stack eliminado: $STACK"
+
+      # -----------------------------------------------------------------------
+      # Capturar Outputs del stack
+      # -----------------------------------------------------------------------
+      - name: "📤 Capturar Outputs del stack"
+        id: stack_outputs
+        if: env.ACTION == 'deploy' && steps.deploy.outputs.stack_status != 'FAILED'
+        run: |
+          STACK="${{ env.STACK_NAME }}"
+
+          OUTPUTS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'Stacks[0].Outputs' \
+            --output json 2>/dev/null || echo "[]")
+
+          echo "json=$OUTPUTS" >> "$GITHUB_OUTPUT"
+
+          echo "📤 Stack Outputs:"
+          echo "$OUTPUTS" | jq -r '.[] | "\(.OutputKey): \(.OutputValue)"' 2>/dev/null || echo "(Sin outputs)"
+
+          echo "$OUTPUTS" > /tmp/cfn-outputs.json
+
+      # -----------------------------------------------------------------------
+      # Guardar artefactos y Job Summary
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar artefactos"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "cfn-${{ github.event.inputs.action || 'changeset' }}-${{ github.event.inputs.stack_name }}-${{ github.run_id }}"
+          path: |
+            /tmp/cfn-deploy-output.txt
+            /tmp/changeset-details.json
+            /tmp/cfn-outputs.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # ☁️ CloudFormation ${{ github.event.inputs.action || 'changeset' }} — ${{ github.event.inputs.stack_name }}
+
+          | Campo | Valor |
+          |-------|-------|
+          | Stack | \`${{ env.STACK_NAME }}\` |
+          | Acción | \`${{ env.ACTION }}\` |
+          | Entorno | \`${{ github.event.inputs.environment || 'staging' }}\` |
+          | Template | \`${{ github.event.inputs.template_path || 'template.yaml' }}\` |
+          | Región | \`${{ env.AWS_REGION }}\` |
+          | Estado | ${{ steps.deploy.outputs.stack_status || steps.changeset.outputs.changeset_status || 'N/A' }} |
+          EOF

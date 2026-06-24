@@ -1,0 +1,890 @@
+# =============================================================================
+# .github/workflows/iac-security.yml
+# Seguridad y validación de Infraestructura como Código (IaC)
+# =============================================================================
+#
+# COBERTURA:
+#   ✅ Terraform: validate, plan, tfsec, checkov, infracost
+#   ✅ Docker: hadolint, trivy image scan, docker-slim analysis
+#   ✅ Kubernetes: kubesec, kube-score, kubeval, polaris
+#   ✅ Helm: helm lint, helm template, checkov sobre manifiestos
+#   ✅ Secrets: detect-secrets, truffleHog sobre IaC files
+#   ✅ Costos: infracost estimate sobre Terraform plans
+#   ✅ SBOM: generación de Software Bill of Materials con syft
+#
+# TRIGGERS:
+#   - push/PR con cambios en infra/, terraform/, kubernetes/, helm/, Dockerfile
+#   - workflow_dispatch para escaneos manuales
+#   - schedule semanal para escaneo completo
+#
+# PREREQUISITOS:
+#   - secrets.TF_API_TOKEN        (Terraform Cloud, opcional)
+#   - secrets.INFRACOST_API_KEY   (infracost.io)
+#   - secrets.AWS_ACCESS_KEY_ID   (si Terraform necesita acceso a AWS para plan)
+#   - secrets.AWS_SECRET_ACCESS_KEY
+# =============================================================================
+
+name: "🔒 IaC Security & Validation"
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "terraform/**"
+      - "infra/**"
+      - "kubernetes/**"
+      - "k8s/**"
+      - "helm/**"
+      - "charts/**"
+      - "Dockerfile"
+      - "Dockerfile.*"
+      - "docker-compose*.yml"
+      - ".github/workflows/iac-security.yml"
+
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "terraform/**"
+      - "infra/**"
+      - "kubernetes/**"
+      - "k8s/**"
+      - "helm/**"
+      - "charts/**"
+      - "Dockerfile"
+      - "Dockerfile.*"
+      - "docker-compose*.yml"
+
+  # Escaneo completo semanal (independientemente de cambios)
+  schedule:
+    - cron: "0 4 * * 0"  # Domingos a las 04:00 UTC
+
+  workflow_dispatch:
+    inputs:
+      scan_terraform:
+        description: "Escanear Terraform"
+        default: true
+        type: boolean
+      scan_docker:
+        description: "Escanear Dockerfiles e imágenes"
+        default: true
+        type: boolean
+      scan_kubernetes:
+        description: "Escanear manifiestos de Kubernetes/Helm"
+        default: true
+        type: boolean
+      run_infracost:
+        description: "Estimar costos de infraestructura (requiere INFRACOST_API_KEY)"
+        default: false
+        type: boolean
+      generate_sbom:
+        description: "Generar Software Bill of Materials (SBOM)"
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  security-events: write   # Subir resultados SARIF al Security tab
+  pull-requests: write     # Comentar en PRs con resumen de hallazgos
+  id-token: write          # OIDC para AWS si se usa terraform plan
+
+concurrency:
+  group: iac-security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Directorios de IaC (ajustar a la estructura de tu proyecto)
+  TF_DIR: ${{ vars.TF_DIR || 'terraform' }}
+  K8S_DIR: ${{ vars.K8S_DIR || 'kubernetes' }}
+  HELM_DIR: ${{ vars.HELM_DIR || 'helm' }}
+  # Versión de Terraform a usar
+  TF_VERSION: ${{ vars.TF_VERSION || '1.9.0' }}
+
+jobs:
+
+  # ===========================================================================
+  # JOB 1: DETECCIÓN — Determinar qué componentes de IaC existen en el repo
+  # ===========================================================================
+  detect-iac:
+    name: "🔍 Detectar componentes IaC"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_terraform:   ${{ steps.detect.outputs.has_terraform }}
+      has_docker:      ${{ steps.detect.outputs.has_docker }}
+      has_kubernetes:  ${{ steps.detect.outputs.has_kubernetes }}
+      has_helm:        ${{ steps.detect.outputs.has_helm }}
+      has_compose:     ${{ steps.detect.outputs.has_compose }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🔍 Detectar archivos de IaC"
+        id: detect
+        run: |
+          # Terraform
+          if find . -name "*.tf" -not -path "*/.terraform/*" | grep -q .; then
+            echo "has_terraform=true" >> "$GITHUB_OUTPUT"
+            TF_FILES=$(find . -name "*.tf" -not -path "*/.terraform/*" | wc -l)
+            echo "✅ Terraform: $TF_FILES archivo(s) .tf encontrado(s)"
+          else
+            echo "has_terraform=false" >> "$GITHUB_OUTPUT"
+            echo "⬜ Terraform: no encontrado"
+          fi
+
+          # Docker
+          if find . \( -name "Dockerfile" -o -name "Dockerfile.*" \) -not -path "*/node_modules/*" | grep -q .; then
+            echo "has_docker=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Docker: Dockerfile(s) encontrado(s)"
+          else
+            echo "has_docker=false" >> "$GITHUB_OUTPUT"
+            echo "⬜ Docker: no encontrado"
+          fi
+
+          # Kubernetes (manifiestos YAML)
+          if find . \( -path "*/kubernetes/*.yaml" -o -path "*/kubernetes/*.yml" -o -path "*/k8s/*.yaml" \) 2>/dev/null | grep -q .; then
+            echo "has_kubernetes=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Kubernetes: manifiestos encontrados"
+          else
+            echo "has_kubernetes=false" >> "$GITHUB_OUTPUT"
+            echo "⬜ Kubernetes: no encontrado"
+          fi
+
+          # Helm
+          if find . -name "Chart.yaml" -not -path "*/node_modules/*" | grep -q .; then
+            echo "has_helm=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Helm: Chart(s) encontrado(s)"
+          else
+            echo "has_helm=false" >> "$GITHUB_OUTPUT"
+            echo "⬜ Helm: no encontrado"
+          fi
+
+          # Docker Compose
+          if find . -name "docker-compose*.yml" -o -name "docker-compose*.yaml" | grep -q .; then
+            echo "has_compose=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Docker Compose: encontrado"
+          else
+            echo "has_compose=false" >> "$GITHUB_OUTPUT"
+            echo "⬜ Docker Compose: no encontrado"
+          fi
+
+  # ===========================================================================
+  # JOB 2: TERRAFORM — Validación y análisis de seguridad
+  # ===========================================================================
+  terraform-security:
+    name: "🏗️ Terraform Security"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: detect-iac
+    if: |
+      needs.detect-iac.outputs.has_terraform == 'true' &&
+      (github.event.inputs.scan_terraform != 'false')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Setup Terraform
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # Para Terraform Cloud (opcional):
+          # cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Caché de providers de Terraform (ahorra 2-5 minutos en cada ejecución)
+      # -----------------------------------------------------------------------
+      - name: "💾 Cache Terraform providers"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.TF_DIR }}/.terraform
+            ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      # -----------------------------------------------------------------------
+      # terraform fmt: Verifica el formato del código HCL
+      # -----------------------------------------------------------------------
+      - name: "🔍 terraform fmt (verificar formato)"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform fmt -check -recursive -diff
+        continue-on-error: true  # Reportar pero no fallar el job completo
+
+      # -----------------------------------------------------------------------
+      # terraform init + validate: Validar sintaxis y configuración
+      # -----------------------------------------------------------------------
+      - name: "⚙️ terraform init"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend=false \
+            -input=false
+            # -backend=false: no conectar al backend real para validación en CI
+        env:
+          # Si usas providers de AWS para el init:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: "✅ terraform validate"
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate -json | tee /tmp/tf-validate.json
+        # Si validate falla, el job falla aquí (es un error crítico de sintaxis)
+
+      # -----------------------------------------------------------------------
+      # tfsec: Escáner de seguridad especializado en Terraform
+      # Detecta: recursos sin cifrado, puertos abiertos, políticas IAM permisivas, etc.
+      # -----------------------------------------------------------------------
+      - name: "🛡️ tfsec - Análisis de seguridad Terraform"
+        uses: aquasecurity/tfsec-sarif-action@v0.1.4
+        with:
+          sarif_file: tfsec.sarif
+          working_directory: ${{ env.TF_DIR }}
+          # Severidad mínima: CRITICAL, HIGH, MEDIUM, LOW, NONE
+          minimum_severity: MEDIUM
+
+      - name: "📤 Upload tfsec SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: tfsec.sarif
+          category: tfsec
+
+      # -----------------------------------------------------------------------
+      # checkov: Análisis estático de IaC multi-plataforma
+      # Soporta Terraform, CloudFormation, Kubernetes, Dockerfile, ARM templates
+      # -----------------------------------------------------------------------
+      - name: "🔬 Checkov - Análisis multi-framework"
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ env.TF_DIR }}
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: true  # true = no fallar el build, solo reportar
+          # Para omitir checks específicos (por ID):
+          # skip_check: CKV_AWS_20,CKV_AWS_57
+        continue-on-error: true
+
+      - name: "📤 Upload Checkov SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-terraform
+
+      # -----------------------------------------------------------------------
+      # terraform plan: Generar plan de cambios para revisar en PRs
+      # NOTA: Requiere credenciales reales del cloud provider
+      # Solo se ejecuta en PRs para mostrar qué cambiaría
+      # -----------------------------------------------------------------------
+      - name: "📋 terraform plan (solo en PRs)"
+        if: github.event_name == 'pull_request'
+        working-directory: ${{ env.TF_DIR }}
+        id: tf_plan
+        run: |
+          # Generar el plan en formato JSON para análisis
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan.binary \
+            2>&1 | tee /tmp/tf-plan-output.txt || true
+
+          # Si el plan falló (probablemente por falta de credenciales en PRs de forks),
+          # continuar y reportar lo que podamos
+          if [ -f "tfplan.binary" ]; then
+            terraform show -json tfplan.binary > tfplan.json
+            echo "plan_available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "plan_available=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Plan no disponible (probablemente faltan credenciales)"
+          fi
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION || 'us-east-1' }}
+          TF_VAR_environment:    "staging"
+        continue-on-error: true
+
+      - name: "💬 Comentar plan de Terraform en PR"
+        if: github.event_name == 'pull_request' && steps.tf_plan.outputs.plan_available == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('/tmp/tf-plan-output.txt', 'utf8');
+
+            // Limitar a 65000 chars (límite de comentarios de GitHub)
+            const truncated = planOutput.length > 60000
+              ? planOutput.substring(0, 60000) + '\n\n... (truncado)'
+              : planOutput;
+
+            const body = `## 🏗️ Terraform Plan
+
+            <details>
+            <summary>Ver plan completo</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            </details>
+
+            > ⚠️ Este plan es una **simulación**. Los cambios reales requieren aprobación manual.
+            > Generado automáticamente por el workflow de IaC Security.`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      # -----------------------------------------------------------------------
+      # infracost: Estimación de costos de la infraestructura
+      # -----------------------------------------------------------------------
+      - name: "💰 Infracost - Estimación de costos"
+        if: |
+          github.event.inputs.run_infracost == 'true' &&
+          secrets.INFRACOST_API_KEY != ''
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: "💰 Generar estimación de costos"
+        if: |
+          github.event.inputs.run_infracost == 'true' &&
+          secrets.INFRACOST_API_KEY != ''
+        run: |
+          infracost breakdown \
+            --path ${{ env.TF_DIR }} \
+            --format json \
+            --out-file /tmp/infracost.json
+
+          infracost output \
+            --path /tmp/infracost.json \
+            --format table
+
+          # En PRs, mostrar el diff de costos respecto a main
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            infracost diff \
+              --path ${{ env.TF_DIR }} \
+              --format json \
+              --compare-to /tmp/infracost-base.json \
+              --out-file /tmp/infracost-diff.json || true
+          fi
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+  # ===========================================================================
+  # JOB 3: DOCKER — Lint y análisis de seguridad de Dockerfiles
+  # ===========================================================================
+  docker-security:
+    name: "🐳 Docker Security"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: detect-iac
+    if: |
+      needs.detect-iac.outputs.has_docker == 'true' &&
+      (github.event.inputs.scan_docker != 'false')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # hadolint: El linter estándar para Dockerfiles
+      # Verifica mejores prácticas: no usar :latest, no instalar packages innecesarios,
+      # usar COPY en lugar de ADD, multi-stage builds, etc.
+      # -----------------------------------------------------------------------
+      - name: "🔍 hadolint - Lint Dockerfiles"
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          # Analizar TODOS los Dockerfiles del repo
+          recursive: true
+          # Generar SARIF para el Security tab de GitHub
+          format: sarif
+          output-file: hadolint.sarif
+          # Tratar estos warnings como errores:
+          failure-threshold: error
+          # Ignorar reglas específicas (ajustar según tu proyecto):
+          # ignore: DL3008,DL3009
+        continue-on-error: true
+
+      - name: "📤 Upload hadolint SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint
+
+      # -----------------------------------------------------------------------
+      # Construir la imagen para analizarla con Trivy
+      # NOTA: Solo construimos, NO hacemos push
+      # -----------------------------------------------------------------------
+      - name: "🏗️ Build imagen Docker para análisis"
+        id: build_image
+        run: |
+          # Encontrar el primer Dockerfile (ajustar si tienes múltiples)
+          DOCKERFILE=$(find . -name "Dockerfile" -not -path "*/node_modules/*" | head -1)
+          if [ -z "$DOCKERFILE" ]; then
+            echo "No se encontró Dockerfile"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CONTEXT_DIR=$(dirname "$DOCKERFILE")
+          IMAGE_TAG="iac-scan-local:${{ github.sha }}"
+
+          echo "Construyendo: $DOCKERFILE (contexto: $CONTEXT_DIR)"
+
+          docker build \
+            -t "$IMAGE_TAG" \
+            -f "$DOCKERFILE" \
+            "$CONTEXT_DIR" \
+            --no-cache \
+            2>&1 | tail -20
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "built=true" >> "$GITHUB_OUTPUT"
+          echo "✅ Imagen construida: $IMAGE_TAG"
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Trivy: Escaneo de vulnerabilidades en la imagen construida
+      # Detecta CVEs en packages del SO y dependencias de la app
+      # -----------------------------------------------------------------------
+      - name: "🔬 Trivy - Scan de imagen Docker"
+        if: steps.build_image.outputs.built == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build_image.outputs.image_tag }}
+          format: "sarif"
+          output: "trivy-image.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM"
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+
+      - name: "📤 Upload Trivy image SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && steps.build_image.outputs.built == 'true'
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-docker-image
+
+      # -----------------------------------------------------------------------
+      # Trivy: Escanear el Dockerfile en modo filesystem (sin construir)
+      # Detecta misconfigurations en el Dockerfile mismo
+      # -----------------------------------------------------------------------
+      - name: "🔬 Trivy - Config scan Dockerfile"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "config"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-config.sarif"
+          exit-code: "0"
+
+      - name: "📤 Upload Trivy config SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-docker-config
+
+      # -----------------------------------------------------------------------
+      # Checkov: Análisis de seguridad de Dockerfiles y docker-compose
+      # -----------------------------------------------------------------------
+      - name: "🔬 Checkov - Análisis Dockerfile y Compose"
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: "."
+          framework: "dockerfile,docker_compose"
+          output_format: sarif
+          output_file_path: checkov-docker.sarif
+          soft_fail: true
+        continue-on-error: true
+
+      - name: "📤 Upload Checkov Docker SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-docker.sarif
+          category: checkov-docker
+
+      # -----------------------------------------------------------------------
+      # Generar SBOM de la imagen con Syft
+      # SBOM = Software Bill of Materials: inventario de todos los componentes
+      # -----------------------------------------------------------------------
+      - name: "📋 Syft - Generar SBOM de imagen Docker"
+        if: |
+          steps.build_image.outputs.built == 'true' &&
+          (github.event.inputs.generate_sbom != 'false')
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.build_image.outputs.image_tag }}
+          format: spdx-json
+          output-file: sbom-docker.spdx.json
+          artifact-name: sbom-docker-${{ github.sha }}.spdx.json
+
+  # ===========================================================================
+  # JOB 4: KUBERNETES — Validación y análisis de manifiestos
+  # ===========================================================================
+  kubernetes-security:
+    name: "☸️ Kubernetes Security"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: detect-iac
+    if: |
+      needs.detect-iac.outputs.has_kubernetes == 'true' ||
+      needs.detect-iac.outputs.has_helm == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # kubeval: Valida que los manifiestos YAML cumplan con el schema de K8s
+      # Detecta: campos desconocidos, tipos incorrectos, versiones de API obsoletas
+      # -----------------------------------------------------------------------
+      - name: "✅ kubeval - Validar schemas K8s"
+        if: needs.detect-iac.outputs.has_kubernetes == 'true'
+        run: |
+          # Instalar kubeval
+          curl -sL https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz \
+            | tar xz kubeval
+          chmod +x kubeval
+
+          # Validar todos los manifiestos del directorio de K8s
+          K8S_MANIFESTS=$(find ${{ env.K8S_DIR }} -name "*.yaml" -o -name "*.yml" 2>/dev/null | head -50)
+
+          if [ -z "$K8S_MANIFESTS" ]; then
+            echo "⬜ No se encontraron manifiestos en ${{ env.K8S_DIR }}"
+            exit 0
+          fi
+
+          echo "Validando manifiestos de Kubernetes..."
+          echo "$K8S_MANIFESTS" | xargs ./kubeval \
+            --strict \
+            --kubernetes-version 1.29.0 \
+            --ignore-missing-schemas \
+            2>&1 | tee /tmp/kubeval-output.txt
+
+          ERRORS=$(grep -c "ERR" /tmp/kubeval-output.txt 2>/dev/null || echo "0")
+          echo "Errores encontrados: $ERRORS"
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # kube-score: Análisis de mejores prácticas en manifiestos K8s
+      # Verifica: resource limits, security contexts, health probes, etc.
+      # -----------------------------------------------------------------------
+      - name: "🔍 kube-score - Análisis de mejores prácticas"
+        if: needs.detect-iac.outputs.has_kubernetes == 'true'
+        run: |
+          # Instalar kube-score
+          curl -sL https://github.com/zegl/kube-score/releases/download/v1.18.0/kube-score_1.18.0_linux_amd64.tar.gz \
+            | tar xz kube-score
+          chmod +x kube-score
+
+          K8S_MANIFESTS=$(find ${{ env.K8S_DIR }} -name "*.yaml" -o -name "*.yml" 2>/dev/null)
+
+          if [ -z "$K8S_MANIFESTS" ]; then
+            echo "⬜ No se encontraron manifiestos"
+            exit 0
+          fi
+
+          echo "Analizando mejores prácticas de Kubernetes..."
+          echo "$K8S_MANIFESTS" | xargs cat | ./kube-score score - \
+            --output-format sarif \
+            > kube-score.sarif 2>/dev/null || true
+
+          # También mostrar en formato legible
+          echo "$K8S_MANIFESTS" | xargs cat | ./kube-score score - \
+            --output-format human 2>&1 | tail -50 || true
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # kubesec: Análisis de seguridad específico para manifiestos K8s
+      # Detecta: containers en modo privilegiado, hostPath mounts peligrosos,
+      # ausencia de securityContext, capabilities peligrosas, etc.
+      # -----------------------------------------------------------------------
+      - name: "🛡️ kubesec - Análisis de seguridad K8s"
+        if: needs.detect-iac.outputs.has_kubernetes == 'true'
+        run: |
+          # Instalar kubesec
+          curl -sSL https://github.com/controlplaneio/kubesec/releases/download/v2.14.0/kubesec_linux_amd64.tar.gz \
+            | tar xz kubesec
+          chmod +x kubesec
+
+          CRITICAL_FOUND=0
+
+          # Analizar cada manifest por separado (kubesec opera por archivo)
+          for manifest in $(find ${{ env.K8S_DIR }} -name "*.yaml" -o -name "*.yml" 2>/dev/null); do
+            echo "--- Analizando: $manifest ---"
+            RESULT=$(./kubesec scan "$manifest" 2>/dev/null || echo '[]')
+            SCORE=$(echo "$RESULT" | jq -r '.[0].score // 0' 2>/dev/null || echo "0")
+            echo "Score: $SCORE"
+            if [ "$SCORE" -lt 0 ] 2>/dev/null; then
+              echo "❌ Score negativo detectado en $manifest"
+              CRITICAL_FOUND=$((CRITICAL_FOUND + 1))
+            fi
+          done
+
+          if [ "$CRITICAL_FOUND" -gt 0 ]; then
+            echo "⚠️ Se encontraron $CRITICAL_FOUND manifiesto(s) con score negativo de seguridad"
+            # No fallar el job, solo reportar
+          else
+            echo "✅ Todos los manifiestos tienen score de seguridad aceptable"
+          fi
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Checkov para Kubernetes
+      # -----------------------------------------------------------------------
+      - name: "🔬 Checkov - Kubernetes"
+        if: needs.detect-iac.outputs.has_kubernetes == 'true'
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ env.K8S_DIR }}
+          framework: kubernetes
+          output_format: sarif
+          output_file_path: checkov-k8s.sarif
+          soft_fail: true
+        continue-on-error: true
+
+      - name: "📤 Upload Checkov K8s SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-k8s.sarif
+          category: checkov-kubernetes
+
+      # -----------------------------------------------------------------------
+      # HELM: Lint y renderizado de templates
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Helm"
+        if: needs.detect-iac.outputs.has_helm == 'true'
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.15.0"
+
+      - name: "🔍 helm lint - Validar charts"
+        if: needs.detect-iac.outputs.has_helm == 'true'
+        run: |
+          # Encontrar todos los charts (directorios con Chart.yaml)
+          CHARTS=$(find . -name "Chart.yaml" -not -path "*/node_modules/*" | xargs dirname)
+
+          for chart in $CHARTS; do
+            echo "=== Lint: $chart ==="
+            helm lint "$chart" --strict 2>&1
+          done
+
+      - name: "📋 helm template - Renderizar templates"
+        if: needs.detect-iac.outputs.has_helm == 'true'
+        run: |
+          CHARTS=$(find . -name "Chart.yaml" -not -path "*/node_modules/*" | xargs dirname)
+
+          for chart in $CHARTS; do
+            CHART_NAME=$(basename "$chart")
+            echo "=== Template: $chart ==="
+            helm template "test-$CHART_NAME" "$chart" \
+              --generate-name \
+              > /tmp/helm-rendered-$CHART_NAME.yaml 2>&1 || true
+            echo "✅ Template renderizado para $CHART_NAME"
+          done
+
+      # Checkov sobre los manifiestos renderizados de Helm
+      - name: "🔬 Checkov - Helm (manifiestos renderizados)"
+        if: needs.detect-iac.outputs.has_helm == 'true'
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ env.HELM_DIR }}
+          framework: helm
+          output_format: sarif
+          output_file_path: checkov-helm.sarif
+          soft_fail: true
+        continue-on-error: true
+
+      - name: "📤 Upload Checkov Helm SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-helm.sarif
+          category: checkov-helm
+
+  # ===========================================================================
+  # JOB 5: SECRETS — Escaneo de secretos en código IaC
+  # ===========================================================================
+  secrets-scan:
+    name: "🔑 Secrets Scan en IaC"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Historial completo para TruffleHog
+
+      # -----------------------------------------------------------------------
+      # TruffleHog: Escaneo de secretos en el historial de Git
+      # Detecta tokens, API keys, contraseñas hardcodeadas en código IaC
+      # -----------------------------------------------------------------------
+      - name: "🔑 TruffleHog - Escaneo de secretos en IaC"
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: >
+            --only-verified
+            --include-paths=.trufflehog-include.txt
+          # Crear .trufflehog-include.txt con patrones de archivos IaC:
+          # terraform/**
+          # kubernetes/**
+          # helm/**
+          # *.tf
+          # *.yaml
+          # *.yml
+          # Dockerfile
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # detect-secrets: Análisis adicional de patrones de secretos
+      # -----------------------------------------------------------------------
+      - name: "🔑 detect-secrets - Análisis de patrones"
+        run: |
+          pip install detect-secrets -q
+
+          # Escanear solo archivos de IaC
+          detect-secrets scan \
+            --baseline .secrets.baseline \
+            --exclude-files "\.git/.*" \
+            --exclude-files "node_modules/.*" \
+            --exclude-files "vendor/.*" \
+            -- terraform/ kubernetes/ helm/ Dockerfile docker-compose*.yml \
+            2>/dev/null > /tmp/secrets-scan.json || true
+
+          # Verificar si hay nuevos secretos (comparando con el baseline)
+          if detect-secrets audit .secrets.baseline 2>/dev/null; then
+            echo "✅ No se encontraron secretos nuevos"
+          else
+            echo "⚠️ Posibles secretos detectados. Revisar el output anterior."
+          fi
+        continue-on-error: true
+
+  # ===========================================================================
+  # JOB 6: SBOM — Software Bill of Materials del repositorio completo
+  # ===========================================================================
+  generate-sbom:
+    name: "📋 Generar SBOM"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: detect-iac
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event.inputs.generate_sbom != 'false')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Syft: Genera SBOM del repositorio (código fuente, no imagen)
+      # Formatos soportados: SPDX, CycloneDX, Syft JSON
+      # -----------------------------------------------------------------------
+      - name: "📋 Syft - Generar SBOM del repositorio"
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom-repo.spdx.json
+          artifact-name: sbom-${{ github.sha }}.spdx.json
+          upload-artifact: true
+
+      - name: "📋 Syft - Generar SBOM en formato CycloneDX"
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom-repo.cyclonedx.json
+          artifact-name: sbom-cyclonedx-${{ github.sha }}.json
+          upload-artifact: true
+
+      # -----------------------------------------------------------------------
+      # Grype: Escanear el SBOM en busca de vulnerabilidades conocidas
+      # -----------------------------------------------------------------------
+      - name: "🔬 Grype - Vulnerabilidades en SBOM"
+        uses: anchore/scan-action@v4
+        with:
+          sbom: sbom-repo.spdx.json
+          fail-build: false
+          severity-cutoff: high
+          output-format: sarif
+
+      - name: "📤 Upload Grype SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
+          category: grype-sbom
+
+  # ===========================================================================
+  # JOB 7: RESUMEN — Consolidar resultados y reportar
+  # ===========================================================================
+  summary:
+    name: "📊 Resumen IaC Security"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [detect-iac, terraform-security, docker-security, kubernetes-security, secrets-scan]
+    if: always()
+
+    steps:
+      - name: "📊 Generar resumen de seguridad IaC"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          # 🔒 IaC Security Scan — Resumen
+
+          ## Componentes detectados
+
+          | Componente | Presente | Estado |
+          |-----------|---------|--------|
+          | Terraform | ${{ needs.detect-iac.outputs.has_terraform == 'true' && '✅' || '⬜' }} | ${{ needs.terraform-security.result || 'skipped' }} |
+          | Docker | ${{ needs.detect-iac.outputs.has_docker == 'true' && '✅' || '⬜' }} | ${{ needs.docker-security.result || 'skipped' }} |
+          | Kubernetes | ${{ needs.detect-iac.outputs.has_kubernetes == 'true' && '✅' || '⬜' }} | ${{ needs.kubernetes-security.result || 'skipped' }} |
+          | Helm | ${{ needs.detect-iac.outputs.has_helm == 'true' && '✅' || '⬜' }} | ${{ needs.kubernetes-security.result || 'skipped' }} |
+
+          ## Herramientas ejecutadas
+
+          | Herramienta | Tipo | Scope |
+          |------------|------|-------|
+          | tfsec | Seguridad | Terraform |
+          | checkov | Multi-framework | Terraform, Docker, K8s, Helm |
+          | hadolint | Lint | Dockerfiles |
+          | trivy | Vulnerabilidades | Imágenes Docker + Filesystem |
+          | kubeval | Validación | Manifiestos K8s |
+          | kube-score | Mejores prácticas | Manifiestos K8s |
+          | kubesec | Seguridad | Manifiestos K8s |
+          | helm lint | Validación | Charts de Helm |
+          | TruffleHog | Secretos | Todo el repo |
+          | Syft/Grype | SBOM | Todo el repo |
+
+          > 📌 Los resultados detallados están disponibles en la pestaña **Security → Code scanning alerts**.
+          EOF
+
+          # Determinar el estado general
+          FAILED_JOBS=""
+          [ "${{ needs.terraform-security.result }}" = "failure" ] && FAILED_JOBS="$FAILED_JOBS terraform"
+          [ "${{ needs.docker-security.result }}"    = "failure" ] && FAILED_JOBS="$FAILED_JOBS docker"
+          [ "${{ needs.kubernetes-security.result }}" = "failure" ] && FAILED_JOBS="$FAILED_JOBS kubernetes"
+          [ "${{ needs.secrets-scan.result }}"       = "failure" ] && FAILED_JOBS="$FAILED_JOBS secrets"
+
+          if [ -n "$FAILED_JOBS" ]; then
+            echo "⚠️ Jobs con fallos: $FAILED_JOBS"
+            echo "Ver detalles en el Security tab del repositorio"
+          else
+            echo "✅ Todos los escaneos completados"
+          fi

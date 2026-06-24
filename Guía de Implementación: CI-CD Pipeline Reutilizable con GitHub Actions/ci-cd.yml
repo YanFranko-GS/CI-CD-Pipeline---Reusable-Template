@@ -1,0 +1,1313 @@
+# =============================================================================
+# CI/CD Pipeline - Reusable Template
+# =============================================================================
+# Versión: 2.0.0
+# Autor: DevOps Team
+# Descripción: Plantilla modular y reutilizable de CI/CD para proyectos
+#              Node.js, Python, Java, Go y contenedores Docker.
+#
+# USO COMO REUSABLE WORKFLOW:
+#   Desde otro repositorio, invoca con:
+#     jobs:
+#       call-pipeline:
+#         uses: <org>/<repo>/.github/workflows/ci-cd.yml@main
+#         with:
+#           project_type: 'node'
+#           deployment_target: 'docker_hub'
+#         secrets: inherit
+#
+# BADGE PARA README:
+#   ![CI/CD Pipeline](https://github.com/<ORG>/<REPO>/actions/workflows/ci-cd.yml/badge.svg)
+# =============================================================================
+
+name: "CI/CD Pipeline - Reusable Template"
+
+# =============================================================================
+# TRIGGERS (DESENCADENANTES)
+# =============================================================================
+on:
+  # Push a ramas de desarrollo activo
+  push:
+    branches:
+      - main          # Rama de producción
+      - develop       # Rama de integración
+      - "feature/**"  # Ramas de características (feature/login, feature/api-v2, etc.)
+    paths-ignore:
+      # Evitar ejecuciones innecesarias por cambios en documentación
+      - "**.md"
+      - ".gitignore"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
+
+  # PRs hacia ramas principales (dispara lint, test y security antes del merge)
+  pull_request:
+    branches:
+      - main
+      - develop
+    types:
+      - opened
+      - synchronize  # Nuevos commits en el PR
+      - reopened
+
+  # Activación manual con parámetros personalizados
+  # Permite desplegar manualmente a staging o producción
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno de despliegue objetivo"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+      skip_tests:
+        description: "Saltar ejecución de tests (solo emergencias)"
+        required: false
+        default: false
+        type: boolean
+
+      project_type:
+        description: "Tipo de proyecto a construir"
+        required: false
+        default: "node"
+        type: choice
+        options:
+          - node
+          - python
+          - java
+          - go
+          - docker
+
+      deployment_target:
+        description: "Plataforma de despliegue"
+        required: false
+        default: "docker_hub"
+        type: choice
+        options:
+          - docker_hub
+          - aws_ecs
+          - github_pages
+          - vercel
+          - netlify
+          - kubernetes
+
+# =============================================================================
+# INPUTS (cuando se usa como Reusable Workflow vía workflow_call)
+# =============================================================================
+# Descomenta este bloque y COMENTA el bloque `on` de arriba si deseas
+# usar este workflow exclusivamente como reusable desde otros repos.
+#
+# on:
+#   workflow_call:
+#     inputs:
+#       project_type:
+#         description: 'Tipo de proyecto: node | python | java | go | docker'
+#         required: false
+#         default: 'node'
+#         type: string
+#       deployment_target:
+#         description: 'Plataforma objetivo: docker_hub | aws_ecs | github_pages | vercel | netlify'
+#         required: false
+#         default: 'docker_hub'
+#         type: string
+#       node_versions:
+#         description: 'JSON array de versiones Node (ej: ["18","20","22"])'
+#         required: false
+#         default: '["20","22"]'
+#         type: string
+#       python_versions:
+#         description: 'JSON array de versiones Python'
+#         required: false
+#         default: '["3.11","3.12"]'
+#         type: string
+#       skip_tests:
+#         description: 'Saltar tests (solo emergencias)'
+#         required: false
+#         default: false
+#         type: boolean
+#     secrets:
+#       DOCKER_HUB_USERNAME:
+#         required: false
+#       DOCKER_HUB_TOKEN:
+#         required: false
+#       AWS_ACCESS_KEY_ID:
+#         required: false
+#       AWS_SECRET_ACCESS_KEY:
+#         required: false
+#       SLACK_WEBHOOK_URL:
+#         required: false
+#       SNYK_TOKEN:
+#         required: false
+
+# =============================================================================
+# VARIABLES DE ENTORNO GLOBALES
+# =============================================================================
+env:
+  # Tipo de proyecto (se puede sobreescribir por input o variable de repositorio)
+  PROJECT_TYPE: ${{ github.event.inputs.project_type || vars.PROJECT_TYPE || 'node' }}
+
+  # Plataforma de despliegue objetivo
+  DEPLOYMENT_TARGET: ${{ github.event.inputs.deployment_target || vars.DEPLOYMENT_TARGET || 'docker_hub' }}
+
+  # Nombre de la imagen Docker (ajustar a tu organización)
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || github.repository }}
+
+  # Directorio de trabajo (monorepos pueden usar un subdirectorio)
+  WORKING_DIR: ${{ vars.WORKING_DIR || '.' }}
+
+  # Registry de Docker Hub
+  REGISTRY: docker.io
+
+  # Variables de notificación
+  NOTIFY_SLACK: ${{ vars.NOTIFY_SLACK || 'true' }}
+  NOTIFY_DISCORD: ${{ vars.NOTIFY_DISCORD || 'false' }}
+  NOTIFY_TEAMS: ${{ vars.NOTIFY_TEAMS || 'false' }}
+
+# =============================================================================
+# CONTROL DE CONCURRENCIA
+# Cancela ejecuciones anteriores del mismo workflow en la misma rama/PR
+# para evitar desperdicio de recursos y condiciones de carrera.
+# =============================================================================
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true  # Cancela runs previos al hacer push seguidos
+
+# =============================================================================
+# PERMISOS MÍNIMOS DE SEGURIDAD
+# Principio de menor privilegio: solo lo necesario para cada job.
+# Los jobs individuales pueden sobreescribir con permisos más específicos.
+# =============================================================================
+permissions:
+  contents: read       # Leer código del repositorio
+  packages: write      # Publicar en GitHub Container Registry (si aplica)
+  id-token: write      # Necesario para OIDC (AWS, Azure sin access keys)
+  security-events: write  # Subir resultados SARIF (Trivy, CodeQL)
+  pull-requests: write # Comentar en PRs (reportes de cobertura, etc.)
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+
+  # ===========================================================================
+  # JOB 1: LINT - Análisis estático de código
+  # Detecta problemas de estilo, errores comunes y malas prácticas ANTES
+  # de ejecutar tests costosos.
+  # ===========================================================================
+  lint:
+    name: "🔍 Lint & Static Analysis"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # Evita que un linter colgado bloquee el pipeline
+
+    # Concurrencia específica para lint (diferente a tests para no cancelarlos)
+    concurrency:
+      group: lint-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Checkout del código (siempre primer paso)
+      # fetch-depth: 0 para análisis completo de historial (SonarCloud lo necesita)
+      # -----------------------------------------------------------------------
+      - name: "📥 Checkout código"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Historial completo para SonarCloud y semantic-release
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN NODE.JS: Configurar Node y ESLint
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Node.js"
+        if: env.PROJECT_TYPE == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"  # Versión fija para lint (consistencia)
+          cache: "npm"
+          cache-dependency-path: "${{ env.WORKING_DIR }}/package-lock.json"
+
+      - name: "📦 Instalar dependencias (Node)"
+        if: env.PROJECT_TYPE == 'node'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm ci --prefer-offline  # --prefer-offline usa caché local primero
+
+      - name: "🔍 ESLint"
+        if: env.PROJECT_TYPE == 'node'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npx eslint . --ext .js,.ts,.jsx,.tsx --max-warnings 0
+        # --max-warnings 0: cualquier warning se trata como error
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN PYTHON: Configurar Python y Pylint/Flake8/Black
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Python"
+        if: env.PROJECT_TYPE == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: "📦 Instalar linters (Python)"
+        if: env.PROJECT_TYPE == 'python'
+        run: pip install pylint flake8 black isort mypy
+
+      - name: "🔍 Black (formateo)"
+        if: env.PROJECT_TYPE == 'python'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: black --check .
+
+      - name: "🔍 Flake8 (estilo)"
+        if: env.PROJECT_TYPE == 'python'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: flake8 . --max-line-length=88 --extend-ignore=E203
+
+      - name: "🔍 isort (imports)"
+        if: env.PROJECT_TYPE == 'python'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: isort --check-only .
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN GO: golangci-lint
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Go"
+        if: env.PROJECT_TYPE == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: "🔍 golangci-lint"
+        if: env.PROJECT_TYPE == 'go'
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: ${{ env.WORKING_DIR }}
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN JAVA: Checkstyle
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Java"
+        if: env.PROJECT_TYPE == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "maven"  # Alternativa: 'gradle'
+
+      - name: "🔍 Checkstyle (Java)"
+        if: env.PROJECT_TYPE == 'java'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: mvn checkstyle:check -q
+
+      # -----------------------------------------------------------------------
+      # SonarCloud: Análisis de calidad de código (todos los tipos de proyecto)
+      # Requiere SONAR_TOKEN en secrets y configuración en sonar-project.properties
+      # -----------------------------------------------------------------------
+      - name: "📊 SonarCloud Scan"
+        if: secrets.SONAR_TOKEN != ''
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: ${{ env.WORKING_DIR }}
+        # Crear sonar-project.properties en la raíz del repo:
+        # sonar.projectKey=<ORG>_<REPO>
+        # sonar.organization=<ORG>
+        # sonar.sources=src
+        # sonar.tests=tests
+        # sonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+  # ===========================================================================
+  # JOB 2: TEST - Tests unitarios e integración con matriz de versiones
+  # Se ejecuta en paralelo con lint para mayor velocidad.
+  # ===========================================================================
+  test:
+    name: "🧪 Tests (${{ matrix.os }} / ${{ matrix.version }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    # Skip si el input dice que se salten los tests
+    if: ${{ !inputs.skip_tests && github.event.inputs.skip_tests != 'true' }}
+
+    strategy:
+      fail-fast: false  # Continúa con otras combinaciones aunque una falle
+      matrix:
+        # Sistemas operativos a probar
+        os:
+          - ubuntu-latest
+          # Descomenta para tests cross-platform:
+          # - windows-latest
+          # - macos-latest
+
+        # Las versiones se seleccionan según el tipo de proyecto
+        # Para Node.js
+        version:
+          - "18"
+          - "20"
+          - "22"
+        # Para Python (reemplaza el bloque version con este):
+        # version: ["3.10", "3.11", "3.12"]
+        # Para Java: version: ["17", "21"]
+        # Para Go: version: ["1.21", "1.22", "stable"]
+
+        # Exclusiones de combinaciones específicas
+        exclude:
+          # Windows es más lento; solo testar la versión LTS estable en Windows
+          - os: windows-latest
+            version: "18"
+          - os: windows-latest
+            version: "22"
+
+    steps:
+      - name: "📥 Checkout código"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # SETUP DE RUNTIME (condicional por tipo de proyecto)
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Node.js ${{ matrix.version }}"
+        if: env.PROJECT_TYPE == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.version }}
+          cache: "npm"
+          cache-dependency-path: "${{ env.WORKING_DIR }}/package-lock.json"
+
+      - name: "⚙️ Setup Python ${{ matrix.version }}"
+        if: env.PROJECT_TYPE == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.version }}
+          cache: "pip"
+
+      - name: "⚙️ Setup Go ${{ matrix.version }}"
+        if: env.PROJECT_TYPE == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.version }}
+          cache: true
+
+      - name: "⚙️ Setup Java ${{ matrix.version }}"
+        if: env.PROJECT_TYPE == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.version }}
+          distribution: "temurin"
+          cache: "maven"
+
+      # -----------------------------------------------------------------------
+      # CACHÉ DE DEPENDENCIAS (Node específico - las otras están en setup)
+      # -----------------------------------------------------------------------
+      - name: "💾 Cache node_modules"
+        if: env.PROJECT_TYPE == 'node'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.WORKING_DIR }}/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.version }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.version }}-
+            ${{ runner.os }}-node-
+
+      # -----------------------------------------------------------------------
+      # INSTALACIÓN DE DEPENDENCIAS
+      # -----------------------------------------------------------------------
+      - name: "📦 Instalar dependencias (Node)"
+        if: env.PROJECT_TYPE == 'node'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm ci --prefer-offline
+
+      - name: "📦 Instalar dependencias (Python)"
+        if: env.PROJECT_TYPE == 'python'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio
+
+      - name: "📦 Instalar dependencias (Go)"
+        if: env.PROJECT_TYPE == 'go'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: go mod download
+
+      # -----------------------------------------------------------------------
+      # SERVICIOS AUXILIARES (bases de datos para tests de integración)
+      # Descomenta según necesidad
+      # -----------------------------------------------------------------------
+      # services:
+      #   postgres:
+      #     image: postgres:16
+      #     env:
+      #       POSTGRES_PASSWORD: testpass
+      #       POSTGRES_DB: testdb
+      #     ports: ['5432:5432']
+      #     options: >-
+      #       --health-cmd pg_isready
+      #       --health-interval 10s
+      #       --health-timeout 5s
+      #       --health-retries 5
+      #   redis:
+      #     image: redis:7-alpine
+      #     ports: ['6379:6379']
+      #     options: --health-cmd "redis-cli ping" --health-interval 10s
+
+      # -----------------------------------------------------------------------
+      # EJECUCIÓN DE TESTS CON COBERTURA
+      # -----------------------------------------------------------------------
+      - name: "🧪 Tests unitarios + cobertura (Node)"
+        if: env.PROJECT_TYPE == 'node'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm test -- --coverage --ci --reporters=default --reporters=jest-junit
+        env:
+          CI: true
+          NODE_ENV: test
+
+      - name: "🧪 Tests unitarios + cobertura (Python)"
+        if: env.PROJECT_TYPE == 'python'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml:coverage.xml \
+            --cov-report=lcov:coverage.lcov \
+            --junitxml=test-results.xml \
+            -v
+
+      - name: "🧪 Tests (Go)"
+        if: env.PROJECT_TYPE == 'go'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          go test ./... -v -coverprofile=coverage.out -covermode=atomic
+          go tool cover -func=coverage.out
+
+      - name: "🧪 Tests (Java/Maven)"
+        if: env.PROJECT_TYPE == 'java'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: mvn test -B --no-transfer-progress
+
+      # -----------------------------------------------------------------------
+      # SUBIR REPORTE DE COBERTURA A CODECOV
+      # Requiere CODECOV_TOKEN en secrets (repositorios privados)
+      # -----------------------------------------------------------------------
+      - name: "📊 Upload cobertura a Codecov"
+        # Solo en ubuntu/versión principal para evitar duplicados
+        if: matrix.os == 'ubuntu-latest' && matrix.version == '20'
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info,./coverage.xml,./coverage.out
+          flags: unittests
+          name: codecov-${{ env.PROJECT_TYPE }}
+          fail_ci_if_error: false  # No fallar si Codecov no está configurado
+
+      # -----------------------------------------------------------------------
+      # PUBLICAR RESULTADOS DE TESTS EN LA UI DE GITHUB
+      # -----------------------------------------------------------------------
+      - name: "📋 Publicar resultados de tests"
+        uses: dorny/test-reporter@v1
+        if: always()  # Publicar incluso si los tests fallaron
+        with:
+          name: "Test Results (${{ matrix.os }}, ${{ matrix.version }})"
+          path: "**/test-results.xml,**/junit.xml"
+          reporter: jest-junit
+          fail-on-error: false
+
+  # ===========================================================================
+  # JOB 3: SECURITY - Escaneo de vulnerabilidades y secretos
+  # Corre en paralelo con tests para máxima velocidad.
+  # ===========================================================================
+  security:
+    name: "🔒 Security Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Permisos específicos para subir resultados SARIF al Security tab de GitHub
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: "📥 Checkout código"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # GitLeaks necesita el historial completo
+
+      # -----------------------------------------------------------------------
+      # GITLEAKS: Detecta secretos hardcodeados en el historial de Git
+      # CRÍTICO: Evita que tokens/contraseñas se publiquen en el repo
+      # -----------------------------------------------------------------------
+      - name: "🔑 GitLeaks - Escaneo de secretos"
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Para repos privados con más de 50 commits en la ventana de análisis:
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      # -----------------------------------------------------------------------
+      # TRIVY: Escaneo de vulnerabilidades en sistema de archivos y dependencias
+      # Genera reporte SARIF que aparece en la pestaña Security > Code scanning
+      # -----------------------------------------------------------------------
+      - name: "🔬 Trivy - Filesystem scan"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"  # No fallar el build (usar 1 para política estricta)
+          ignore-unfixed: true  # Ignorar vulnerabilidades sin parche disponible
+
+      - name: "📤 Upload Trivy SARIF a GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: trivy-fs
+
+      # -----------------------------------------------------------------------
+      # SNYK: Análisis de dependencias con base de datos de CVEs de Snyk
+      # Alternativa/complemento a Trivy con foco en dependencias de aplicación
+      # -----------------------------------------------------------------------
+      - name: "🛡️ Snyk - Vulnerabilidades en dependencias"
+        uses: snyk/actions/node@master  # Cambiar: snyk/actions/python@master, etc.
+        if: secrets.SNYK_TOKEN != ''
+        continue-on-error: true  # No bloquear si Snyk falla (servicio externo)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --sarif-file-output=snyk.sarif
+          # Otras opciones útiles:
+          # args: --all-projects (monorepos)
+          # args: --exclude=tests,docs
+
+      - name: "📤 Upload Snyk SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && secrets.SNYK_TOKEN != ''
+        with:
+          sarif_file: snyk.sarif
+          category: snyk
+
+      # -----------------------------------------------------------------------
+      # CODEQL: Análisis semántico profundo (JavaScript, Python, Java, Go, C++)
+      # Detecta vulnerabilidades de lógica que otros escáneres no ven
+      # -----------------------------------------------------------------------
+      - name: "🔭 CodeQL - Análisis semántico"
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ env.PROJECT_TYPE == 'node' && 'javascript' || env.PROJECT_TYPE == 'python' && 'python' || env.PROJECT_TYPE == 'java' && 'java' || env.PROJECT_TYPE == 'go' && 'go' || 'javascript' }}
+          queries: security-and-quality
+
+      - name: "🔭 CodeQL - Autobuild"
+        uses: github/codeql-action/autobuild@v3
+
+      - name: "🔭 CodeQL - Análisis"
+        uses: github/codeql-action/analyze@v3
+
+  # ===========================================================================
+  # JOB 4: BUILD - Construcción del artefacto
+  # Depende de lint y test (no construir si hay errores).
+  # ===========================================================================
+  build:
+    name: "🏗️ Build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint, test]  # Solo construir si lint y test pasan
+
+    # En PRs construir pero NO desplegar (validar que el build funciona)
+    # En push a main/develop: construir y continuar al despliegue
+
+    outputs:
+      # Exportar el tag de imagen para que los jobs de deploy lo usen
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build_push.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: "📥 Checkout código"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # DETERMINAR VERSIÓN SEMÁNTICA
+      # -----------------------------------------------------------------------
+      - name: "🏷️ Determinar versión"
+        id: version
+        run: |
+          # Usar tag de Git si existe, sino usar SHA corto
+          if git describe --tags --exact-match 2>/dev/null; then
+            VERSION=$(git describe --tags --exact-match)
+          else
+            VERSION="${GITHUB_REF_NAME}-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Versión: $VERSION"
+
+      # -----------------------------------------------------------------------
+      # BUILD PARA NODE.JS: Compilación/empaquetado de la app
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Node.js (Build)"
+        if: env.PROJECT_TYPE == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: "📦 npm ci + build (Node)"
+        if: env.PROJECT_TYPE == 'node'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          npm ci --prefer-offline
+          npm run build  # Genera la carpeta dist/
+        env:
+          NODE_ENV: production
+
+      # -----------------------------------------------------------------------
+      # BUILD PARA PYTHON: Crear wheel/sdist con build
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Python (Build)"
+        if: env.PROJECT_TYPE == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: "📦 Build Python package"
+        if: env.PROJECT_TYPE == 'python'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          pip install build
+          python -m build
+
+      # -----------------------------------------------------------------------
+      # BUILD DOCKER: Con caché de capas para builds incrementales rápidos
+      # -----------------------------------------------------------------------
+
+      # Configurar QEMU para builds multi-arquitectura (arm64, amd64)
+      - name: "⚙️ Setup QEMU (multi-arch)"
+        if: env.PROJECT_TYPE == 'docker' || env.DEPLOYMENT_TARGET == 'docker_hub' || env.DEPLOYMENT_TARGET == 'aws_ecs'
+        uses: docker/setup-qemu-action@v3
+
+      # Configurar Docker Buildx (builder avanzado con caché)
+      - name: "🐳 Setup Docker Buildx"
+        if: env.PROJECT_TYPE == 'docker' || env.DEPLOYMENT_TARGET == 'docker_hub' || env.DEPLOYMENT_TARGET == 'aws_ecs'
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:master
+
+      # Extraer metadatos para el tag de la imagen (version, branch, sha, etc.)
+      - name: "🏷️ Docker metadata (tags y labels)"
+        id: meta
+        if: env.DEPLOYMENT_TARGET == 'docker_hub' || env.DEPLOYMENT_TARGET == 'aws_ecs'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag con versión semántica (solo en tags de Git: v1.2.3)
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # Tag con el nombre de la rama
+            type=ref,event=branch
+            # Tag con el SHA del commit (siempre)
+            type=sha,prefix=,format=short
+            # Tag "latest" solo en main
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.title=${{ github.repository }}
+            org.opencontainers.image.description=Automated CI/CD build
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+
+      # Login a Docker Hub
+      - name: "🔐 Login Docker Hub"
+        if: env.DEPLOYMENT_TARGET == 'docker_hub' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          # NUNCA usar secrets.DOCKER_HUB_PASSWORD (usar Access Token en su lugar)
+
+      # Login a Amazon ECR (alternativa a Docker Hub)
+      - name: "🔐 Login Amazon ECR"
+        if: env.DEPLOYMENT_TARGET == 'aws_ecs' && github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@v2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      # Login a GitHub Container Registry (GHCR) - gratuito para proyectos open source
+      - name: "🔐 Login GitHub Container Registry"
+        if: env.DEPLOYMENT_TARGET == 'ghcr' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Caché de capas Docker en GitHub Actions Cache
+      - name: "💾 Cache capas Docker"
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile', '**/docker-compose*.yml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile', '**/docker-compose*.yml') }}-
+            ${{ runner.os }}-buildx-
+
+      # Build y push de la imagen Docker
+      - name: "🐳 Docker Build & Push"
+        id: build_push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKING_DIR }}
+          file: ${{ env.WORKING_DIR }}/Dockerfile
+          platforms: linux/amd64,linux/arm64  # Multi-arquitectura
+          push: ${{ github.event_name != 'pull_request' }}  # No push en PRs
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Caché inteligente: usa capas del build anterior
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.version.outputs.version }}
+          # Secretos para el build (no quedan en la imagen final)
+          # secrets: |
+          #   NPM_TOKEN=${{ secrets.NPM_TOKEN }}
+
+      # Workaround para que la caché no crezca indefinidamente
+      - name: "🔄 Actualizar caché Docker"
+        if: always()
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache 2>/dev/null || true
+
+      # -----------------------------------------------------------------------
+      # ESCANEO DE SEGURIDAD DE LA IMAGEN CONSTRUIDA
+      # Trivy escanea la imagen antes de desplegarla
+      # -----------------------------------------------------------------------
+      - name: "🔬 Trivy - Escaneo de imagen Docker"
+        if: env.DEPLOYMENT_TARGET == 'docker_hub' || env.DEPLOYMENT_TARGET == 'aws_ecs'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-image.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+
+      - name: "📤 Upload Trivy image SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-image.sarif"
+          category: trivy-image
+
+      # -----------------------------------------------------------------------
+      # PUBLICAR ARTEFACTO (para proyectos Node/Python sin Docker)
+      # -----------------------------------------------------------------------
+      - name: "📤 Upload artefacto de build"
+        if: env.PROJECT_TYPE == 'node' || env.PROJECT_TYPE == 'python'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact-${{ steps.version.outputs.version }}
+          path: |
+            ${{ env.WORKING_DIR }}/dist/
+            ${{ env.WORKING_DIR }}/build/
+            ${{ env.WORKING_DIR }}/dist/*.whl
+          retention-days: 7  # Artefactos disponibles 7 días
+
+  # ===========================================================================
+  # JOB 5: DEPLOY STAGING - Despliegue automático al entorno de staging
+  # Solo en push a main/develop o workflow_dispatch hacia staging
+  # ===========================================================================
+  deploy-staging:
+    name: "🚀 Deploy → Staging"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [build, security]
+
+    # Condiciones para desplegar a staging:
+    # 1. Push a develop o main (no PRs)
+    # 2. workflow_dispatch apuntando a staging
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'))
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+
+    # Ambiente de GitHub con protecciones configuradas en la UI
+    # Ve a: Settings > Environments > staging
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL || 'https://staging.example.com' }}
+
+    concurrency:
+      group: deploy-staging-${{ github.ref }}
+      cancel-in-progress: false  # NO cancelar despliegues en progreso
+
+    steps:
+      - name: "📥 Checkout código"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # DESCARGAR ARTEFACTO DEL BUILD (si no es Docker)
+      # -----------------------------------------------------------------------
+      - name: "📥 Download artefacto"
+        if: env.PROJECT_TYPE == 'node' || env.PROJECT_TYPE == 'python'
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-${{ needs.build.outputs.version }}
+          path: ./dist
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN 1: GITHUB PAGES
+      # Para sitios estáticos (frontend, documentación)
+      # -----------------------------------------------------------------------
+      - name: "🌐 Deploy GitHub Pages (Staging)"
+        if: env.DEPLOYMENT_TARGET == 'github_pages'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          destination_dir: staging  # Subdir para staging
+          commit_message: "deploy: staging ${{ needs.build.outputs.version }}"
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN 2: VERCEL
+      # Para apps Next.js, React, Vue, etc.
+      # -----------------------------------------------------------------------
+      - name: "▲ Deploy Vercel (Staging)"
+        if: env.DEPLOYMENT_TARGET == 'vercel'
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          working-directory: ${{ env.WORKING_DIR }}
+          # Sin --prod = preview/staging deployment
+          alias-domains: staging.${{ vars.DOMAIN }}
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN 3: NETLIFY
+      # Para sitios Jamstack
+      # -----------------------------------------------------------------------
+      - name: "🌿 Deploy Netlify (Staging)"
+        if: env.DEPLOYMENT_TARGET == 'netlify'
+        uses: nwtgck/actions-netlify@v3
+        with:
+          publish-dir: "./dist"
+          production-deploy: false  # false = staging/draft
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          deploy-message: "Staging deploy ${{ needs.build.outputs.version }}"
+          enable-pull-request-comment: true
+          enable-commit-comment: true
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN 4: DOCKER HUB / AWS ECS
+      # Para apps contenedorizadas
+      # -----------------------------------------------------------------------
+      - name: "🐳 Deploy ECS (Staging)"
+        if: env.DEPLOYMENT_TARGET == 'aws_ecs'
+        run: |
+          # Actualizar la definición de tarea con la nueva imagen
+          NEW_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "Desplegando imagen: $NEW_IMAGE"
+
+          aws ecs update-service \
+            --cluster ${{ vars.ECS_CLUSTER_STAGING }} \
+            --service ${{ vars.ECS_SERVICE_STAGING }} \
+            --force-new-deployment \
+            --region ${{ vars.AWS_REGION || 'us-east-1' }}
+
+          # Esperar a que el despliegue complete
+          aws ecs wait services-stable \
+            --cluster ${{ vars.ECS_CLUSTER_STAGING }} \
+            --services ${{ vars.ECS_SERVICE_STAGING }} \
+            --region ${{ vars.AWS_REGION || 'us-east-1' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # -----------------------------------------------------------------------
+      # OPCIÓN 5: KUBERNETES
+      # Para clusters K8s (EKS, GKE, AKS, etc.)
+      # -----------------------------------------------------------------------
+      - name: "☸️ Deploy Kubernetes (Staging)"
+        if: env.DEPLOYMENT_TARGET == 'kubernetes'
+        run: |
+          # Usar kubeconfig del secret (base64 encoded)
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > /tmp/kubeconfig
+          export KUBECONFIG=/tmp/kubeconfig
+
+          # Actualizar imagen en el deployment
+          kubectl set image deployment/${{ vars.K8S_DEPLOYMENT_STAGING }} \
+            app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -n staging
+
+          # Esperar rollout
+          kubectl rollout status deployment/${{ vars.K8S_DEPLOYMENT_STAGING }} \
+            -n staging --timeout=5m
+
+          # Limpiar kubeconfig sensible
+          rm /tmp/kubeconfig
+
+      # -----------------------------------------------------------------------
+      # SMOKE TESTS POST-STAGING
+      # Verificar que el despliegue funciona correctamente
+      # -----------------------------------------------------------------------
+      - name: "💨 Smoke tests - Staging"
+        run: |
+          STAGING_URL="${{ vars.STAGING_URL || 'https://staging.example.com' }}"
+          echo "Ejecutando smoke tests contra: $STAGING_URL"
+
+          # Esperar a que el servicio esté disponible (máx 2 minutos)
+          timeout 120 bash -c "until curl -sf $STAGING_URL/health > /dev/null 2>&1; do sleep 5; done"
+
+          # Verificar endpoint de salud
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/health")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ Health check falló: HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✅ Staging desplegado correctamente (HTTP $HTTP_STATUS)"
+          # Añadir más checks según tu aplicación:
+          # curl -sf "$STAGING_URL/api/version" | jq '.version'
+
+  # ===========================================================================
+  # JOB 6: DEPLOY PRODUCTION - Despliegue a producción con aprobación manual
+  # Solo se ejecuta en push a main O workflow_dispatch con env=production
+  # REQUIERE APROBACIÓN MANUAL configurada en el Environment "production"
+  # ===========================================================================
+  deploy-production:
+    name: "🚀 Deploy → Production"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [deploy-staging]  # Siempre pasar por staging primero
+
+    # Condiciones ESTRICTAS para producción:
+    # 1. Solo push a main (no develop, no features)
+    # 2. O workflow_dispatch explícitamente a producción
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+
+    # Ambiente con protección: aprobación manual requerida
+    # Configurar en: Settings > Environments > production
+    # - Required reviewers: DevOps lead, CTO
+    # - Wait timer: 5 minutes (tiempo para cancelar si algo va mal)
+    # - Deployment branches: only main
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL || 'https://example.com' }}
+
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false  # NUNCA cancelar despliegues a producción
+
+    steps:
+      - name: "📥 Checkout código"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # DESCARGA DEL ARTEFACTO
+      # -----------------------------------------------------------------------
+      - name: "📥 Download artefacto de producción"
+        if: env.PROJECT_TYPE == 'node' || env.PROJECT_TYPE == 'python'
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-${{ needs.build.outputs.version }}
+          path: ./dist
+        continue-on-error: true  # El artefacto puede no existir para proyectos Docker
+
+      # -----------------------------------------------------------------------
+      # DESPLIEGUE A PRODUCCIÓN (misma lógica que staging pero con variables prod)
+      # -----------------------------------------------------------------------
+
+      # GitHub Pages producción
+      - name: "🌐 Deploy GitHub Pages (Production)"
+        if: env.DEPLOYMENT_TARGET == 'github_pages'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          cname: ${{ vars.DOMAIN }}  # Dominio personalizado
+          commit_message: "deploy: production ${{ needs.build.outputs.version }}"
+
+      # Vercel producción
+      - name: "▲ Deploy Vercel (Production)"
+        if: env.DEPLOYMENT_TARGET == 'vercel'
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: "--prod"  # Deploy de producción
+          working-directory: ${{ env.WORKING_DIR }}
+
+      # Netlify producción
+      - name: "🌿 Deploy Netlify (Production)"
+        if: env.DEPLOYMENT_TARGET == 'netlify'
+        uses: nwtgck/actions-netlify@v3
+        with:
+          publish-dir: "./dist"
+          production-deploy: true  # true = producción
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          deploy-message: "Production deploy ${{ needs.build.outputs.version }}"
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+
+      # AWS ECS producción
+      - name: "🐳 Deploy ECS (Production)"
+        if: env.DEPLOYMENT_TARGET == 'aws_ecs'
+        id: deploy_ecs_prod
+        run: |
+          NEW_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "Desplegando en producción: $NEW_IMAGE"
+
+          aws ecs update-service \
+            --cluster ${{ vars.ECS_CLUSTER_PROD }} \
+            --service ${{ vars.ECS_SERVICE_PROD }} \
+            --force-new-deployment \
+            --region ${{ vars.AWS_REGION || 'us-east-1' }}
+
+          aws ecs wait services-stable \
+            --cluster ${{ vars.ECS_CLUSTER_PROD }} \
+            --services ${{ vars.ECS_SERVICE_PROD }} \
+            --region ${{ vars.AWS_REGION || 'us-east-1' }} \
+            --timeout 600  # 10 minutos máx
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # -----------------------------------------------------------------------
+      # SMOKE TESTS EN PRODUCCIÓN
+      # Si fallan, activar rollback automático
+      # -----------------------------------------------------------------------
+      - name: "💨 Smoke tests - Production"
+        id: smoke_tests_prod
+        run: |
+          PROD_URL="${{ vars.PRODUCTION_URL || 'https://example.com' }}"
+          echo "Verificando producción: $PROD_URL"
+
+          # Health check
+          timeout 180 bash -c "until curl -sf $PROD_URL/health > /dev/null 2>&1; do sleep 5; done"
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PROD_URL/health")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ Health check de producción falló: HTTP $HTTP_STATUS"
+            exit 1
+          fi
+
+          # Verificar versión desplegada
+          DEPLOYED_VERSION=$(curl -sf "$PROD_URL/api/version" | jq -r '.version' 2>/dev/null || echo "unknown")
+          echo "✅ Producción OK: versión $DEPLOYED_VERSION (HTTP $HTTP_STATUS)"
+
+      # -----------------------------------------------------------------------
+      # ROLLBACK AUTOMÁTICO SI LOS SMOKE TESTS FALLAN
+      # -----------------------------------------------------------------------
+      - name: "⏪ Rollback automático (si smoke tests fallaron)"
+        if: failure() && env.DEPLOYMENT_TARGET == 'aws_ecs'
+        run: |
+          echo "⚠️ Smoke tests fallaron. Iniciando rollback..."
+
+          # Obtener la revisión anterior del servicio
+          PREVIOUS_TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ vars.ECS_CLUSTER_PROD }} \
+            --services ${{ vars.ECS_SERVICE_PROD }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          # Hacer rollback
+          aws ecs update-service \
+            --cluster ${{ vars.ECS_CLUSTER_PROD }} \
+            --service ${{ vars.ECS_SERVICE_PROD }} \
+            --task-definition $PREVIOUS_TASK_DEF \
+            --force-new-deployment
+
+          echo "❌ ROLLBACK INICIADO - Revisar el deployment inmediatamente"
+          exit 1  # Marcar el job como fallido para visibilidad
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # -----------------------------------------------------------------------
+      # CREAR RELEASE DE GITHUB AL DESPLEGAR A PRODUCCIÓN
+      # -----------------------------------------------------------------------
+      - name: "🏷️ Crear GitHub Release"
+        if: success() && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          name: "Release ${{ needs.build.outputs.version }}"
+          generate_release_notes: true  # Auto-genera changelog desde commits
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          # make_latest: true  # Marcar como última release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # JOB 7: RELEASE - Versionado semántico automático con semantic-release
+  # Solo en push a main, después de un despliegue exitoso
+  # ===========================================================================
+  release:
+    name: "📦 Semantic Release"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [deploy-production]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: write  # Para crear tags y releases
+      issues: write    # Para comentar en issues cerrados
+      pull-requests: write
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "⚙️ Setup Node.js para semantic-release"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: "🏷️ Semantic Release"
+        run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}  # Si publicas en npm
+          # semantic-release lee la configuración de:
+          # .releaserc.json, .releaserc.yml, o "release" en package.json
+          # Ejemplo mínimo de .releaserc.json:
+          # {
+          #   "branches": ["main"],
+          #   "plugins": [
+          #     "@semantic-release/commit-analyzer",
+          #     "@semantic-release/release-notes-generator",
+          #     "@semantic-release/changelog",
+          #     "@semantic-release/github"
+          #   ]
+          # }
+
+  # ===========================================================================
+  # JOB 8: NOTIFY - Notificación al finalizar el pipeline
+  # Se ejecuta SIEMPRE (success o failure) para informar al equipo
+  # ===========================================================================
+  notify:
+    name: "🔔 Notificación"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Depende de todos los jobs para notificar el estado final
+    needs: [lint, test, security, build, deploy-staging, deploy-production]
+    # always() = ejecutar incluso si algún job anterior falló
+    if: always()
+
+    steps:
+      - name: "📊 Determinar estado del pipeline"
+        id: status
+        run: |
+          # Evaluar el estado general del workflow
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "emoji=❌" >> "$GITHUB_OUTPUT"
+            echo "color=danger" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "status=cancelled" >> "$GITHUB_OUTPUT"
+            echo "emoji=⚠️" >> "$GITHUB_OUTPUT"
+            echo "color=warning" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "emoji=✅" >> "$GITHUB_OUTPUT"
+            echo "color=good" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # NOTIFICACIÓN A SLACK
+      # -----------------------------------------------------------------------
+      - name: "💬 Notificar Slack"
+        if: env.NOTIFY_SLACK == 'true' && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.emoji }} CI/CD Pipeline: *${{ steps.status.outputs.status }}*",
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "fields": [
+                    {
+                      "title": "Repositorio",
+                      "value": "${{ github.repository }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Rama",
+                      "value": "${{ github.ref_name }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Commit",
+                      "value": "<${{ github.event.compare }}|${{ github.sha }}> - ${{ github.event.head_commit.message }}",
+                      "short": false
+                    },
+                    {
+                      "title": "Actor",
+                      "value": "${{ github.actor }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Workflow",
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver logs>",
+                      "short": true
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # -----------------------------------------------------------------------
+      # NOTIFICACIÓN A DISCORD
+      # -----------------------------------------------------------------------
+      - name: "🎮 Notificar Discord"
+        if: env.NOTIFY_DISCORD == 'true' && secrets.DISCORD_WEBHOOK_URL != ''
+        uses: Ilshidur/action-discord@master
+        with:
+          args: |
+            ${{ steps.status.outputs.emoji }} **CI/CD Pipeline: ${{ steps.status.outputs.status }}**
+            📁 Repo: `${{ github.repository }}`
+            🌿 Rama: `${{ github.ref_name }}`
+            👤 Actor: `${{ github.actor }}`
+            🔗 [Ver logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      # -----------------------------------------------------------------------
+      # NOTIFICACIÓN A MICROSOFT TEAMS
+      # -----------------------------------------------------------------------
+      - name: "📊 Notificar Microsoft Teams"
+        if: env.NOTIFY_TEAMS == 'true' && secrets.TEAMS_WEBHOOK_URL != ''
+        uses: jdcargile/ms-teams-notification@v1.4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          ms-teams-webhook-uri: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          notification-summary: "${{ steps.status.outputs.emoji }} CI/CD: ${{ steps.status.outputs.status }} - ${{ github.repository }}"
+          notification-color: ${{ steps.status.outputs.status == 'success' && '00ff00' || 'ff0000' }}
+          timezone: America/Lima

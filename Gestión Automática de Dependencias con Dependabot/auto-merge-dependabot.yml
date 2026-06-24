@@ -1,0 +1,430 @@
+# =============================================================================
+# .github/workflows/auto-merge-dependabot.yml
+# Fusión automática (auto-merge) de Pull Requests generadas por Dependabot
+# =============================================================================
+#
+# RESUMEN DEL FLUJO:
+#   1. Dependabot abre una PR con una actualización de dependencia.
+#   2. Este workflow se dispara con `pull_request_target`.
+#   3. Se obtienen los metadatos de la PR (tipo de update, ecosistema, etc.).
+#   4. Se espera a que los checks de CI (lint, test) pasen.
+#   5. Si es patch/minor → se aprueba y se habilita el auto-merge.
+#   6. Si es major → se añade una etiqueta de revisión manual y el workflow sale sin error.
+#   7. GitHub fusiona automáticamente la PR cuando todos los checks requeridos pasan.
+#
+# PREREQUISITOS (ver guía detallada):
+#   - "Allow auto-merge" habilitado en Settings > Branches > [rama protegida]
+#   - Checks requeridos configurados en la protección de rama
+#   - El GITHUB_TOKEN tiene permisos de contents:write y pull-requests:write
+#   - (Opcional) PAT almacenado en secrets.AUTOMERGE_TOKEN para saltarse restricciones
+#
+# COMPATIBILIDAD: Repositorios públicos y privados, plans Free y GitHub Team/Enterprise.
+# =============================================================================
+
+name: "🤖 Auto-merge Dependabot PRs"
+
+# =============================================================================
+# TRIGGERS
+# =============================================================================
+on:
+  # pull_request_target: SE USA EN LUGAR DE pull_request por seguridad.
+  # - Se ejecuta en el contexto de la rama BASE (main), NO de la rama del PR.
+  # - Tiene acceso a los secrets del repositorio (a diferencia de pull_request
+  #   en PRs de forks, donde los secrets NO están disponibles).
+  # - IMPORTANTE: Por eso debemos verificar rigurosamente que el actor sea
+  #   dependabot[bot] antes de ejecutar cualquier acción privilegiada.
+  pull_request_target:
+    types:
+      - opened      # PR recién abierta
+      - synchronize # Nuevos commits añadidos a la PR (Dependabot la actualiza)
+      - reopened    # PR cerrada y vuelta a abrir
+    branches:
+      - main
+      # Descomenta si también quieres auto-merge hacia develop:
+      # - develop
+
+  # Activación manual (útil para re-intentar un auto-merge fallido)
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Número de la PR de Dependabot a procesar (opcional)"
+        required: false
+        type: string
+
+# =============================================================================
+# PERMISOS MÍNIMOS NECESARIOS
+# =============================================================================
+permissions:
+  # "write" para poder hacer merge y crear tags
+  contents: write
+  # "write" para aprobar PRs y añadir comentarios/labels
+  pull-requests: write
+
+# =============================================================================
+# VARIABLES DE CONFIGURACIÓN (centralizar aquí facilita el mantenimiento)
+# =============================================================================
+env:
+  # Método de merge: "squash" | "merge" | "rebase"
+  # "squash" → Un único commit limpio en main (recomendado para Dependabot)
+  # "merge"  → Merge commit tradicional (preserva historial de la PR)
+  # "rebase" → Rebase + merge sin merge commit
+  MERGE_METHOD: "squash"
+
+  # ¿Auto-mergear actualizaciones MAJOR automáticamente?
+  # "false" es lo recomendado: las actualizaciones major pueden tener
+  # breaking changes que requieren intervención del equipo.
+  AUTO_MERGE_MAJOR: "false"
+
+  # Etiqueta que se añade a PRs major para que el equipo las revise
+  MANUAL_REVIEW_LABEL: "needs-manual-review"
+
+  # Nombre del check de CI principal que debe pasar antes del merge.
+  # Debe coincidir exactamente con el nombre del job en tu pipeline de CI.
+  # Si tienes varios checks requeridos, la función "auto-merge" de GitHub
+  # esperará a que TODOS pasen automáticamente (sin necesidad de enumerarlos aquí).
+  # CI_CHECK_NAME: "test"
+
+# =============================================================================
+# CONCURRENCIA
+# Evita que múltiples instancias del workflow procesen la misma PR en paralelo.
+# =============================================================================
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false  # No cancelar; cada PR debe procesarse completamente
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  auto-merge:
+    name: "🔀 Auto-merge PR #${{ github.event.pull_request.number }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # -------------------------------------------------------------------------
+    # CONDICIÓN DE SEGURIDAD CRÍTICA:
+    # Solo ejecutar si el actor ES Dependabot o si fue activado manualmente.
+    # Esta verificación es la primera línea de defensa contra el abuso.
+    # -------------------------------------------------------------------------
+    if: |
+      github.actor == 'dependabot[bot]' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      # -----------------------------------------------------------------------
+      # PASO 1: Checkout del repositorio
+      # Necesario para que gh CLI pueda leer la configuración del repo.
+      # -----------------------------------------------------------------------
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          # Checkout de la rama base (main), no de la rama del PR.
+          # Con pull_request_target esto es el comportamiento por defecto.
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      # -----------------------------------------------------------------------
+      # PASO 2: Obtener metadatos de la PR de Dependabot
+      # Esta action oficial de Dependabot extrae información clave:
+      #   - dependency-names: lista de dependencias actualizadas
+      #   - dependency-type: "direct" | "indirect"
+      #   - update-type: "version-update:semver-major" | "semver-minor" | "semver-patch"
+      #   - package-ecosystem: "npm" | "pip" | "docker" | etc.
+      #   - compatible: "true" si la compatibilidad es >= 80% según Dependabot API
+      #   - alert-state: si la actualización cierra una alerta de seguridad
+      #   - ghsa-id: ID del advisory de seguridad (si aplica)
+      #   - cvss: puntuación CVSS (si es una actualización de seguridad)
+      # -----------------------------------------------------------------------
+      - name: "🔍 Obtener metadatos de Dependabot"
+        id: dependabot-metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          # Token necesario para hacer llamadas a la API de GitHub
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+          # Si quieres que la action añada un comentario con los metadatos en la PR:
+          # alert-lookup: true
+          # compat-lookup: true
+
+      # -----------------------------------------------------------------------
+      # PASO 3: Mostrar información del PR en los logs (diagnóstico)
+      # IMPORTANTE: Nunca imprimir secrets en este step.
+      # -----------------------------------------------------------------------
+      - name: "📋 Información de la actualización"
+        run: |
+          echo "=================================================="
+          echo "📦 Dependencias actualizadas: ${{ steps.dependabot-metadata.outputs.dependency-names }}"
+          echo "🏷️  Tipo de actualización:    ${{ steps.dependabot-metadata.outputs.update-type }}"
+          echo "📦 Ecosistema:               ${{ steps.dependabot-metadata.outputs.package-ecosystem }}"
+          echo "🔗 Tipo de dependencia:      ${{ steps.dependabot-metadata.outputs.dependency-type }}"
+          echo "✅ Compatible (>80%):        ${{ steps.dependabot-metadata.outputs.compatible }}"
+          echo "🔒 Estado de alerta:         ${{ steps.dependabot-metadata.outputs.alert-state }}"
+          echo "🔢 CVSS:                     ${{ steps.dependabot-metadata.outputs.cvss }}"
+          echo "=================================================="
+
+      # -----------------------------------------------------------------------
+      # PASO 4: Verificar segunda vez que el actor sigue siendo Dependabot.
+      # "Defense in depth": si el workflow fue modificado maliciosamente para
+      # cambiar el actor, esta verificación lo detiene.
+      # -----------------------------------------------------------------------
+      - name: "🛡️ Verificar actor Dependabot"
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          if [ "${{ github.actor }}" != "dependabot[bot]" ]; then
+            echo "❌ Error: El actor no es dependabot[bot] (es: ${{ github.actor }})"
+            echo "   Este workflow solo debe ser ejecutado por Dependabot."
+            exit 1
+          fi
+          echo "✅ Verificación de actor pasada: ${{ github.actor }}"
+
+      # -----------------------------------------------------------------------
+      # PASO 5: Manejar actualizaciones MAJOR
+      # Las actualizaciones major pueden tener breaking changes significativos.
+      # En lugar de auto-mergear, añadimos una etiqueta para revisión manual.
+      # -----------------------------------------------------------------------
+      - name: "⚠️ Etiquetar PRs major para revisión manual"
+        if: |
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-major' &&
+          env.AUTO_MERGE_MAJOR == 'false'
+        run: |
+          echo "🔴 Actualización MAJOR detectada:"
+          echo "   Dependencia: ${{ steps.dependabot-metadata.outputs.dependency-names }}"
+          echo "   Se añadirá la etiqueta '${{ env.MANUAL_REVIEW_LABEL }}' para revisión manual."
+
+          # Añadir etiqueta de revisión manual
+          gh pr edit "${{ github.event.pull_request.number }}" \
+            --add-label "${{ env.MANUAL_REVIEW_LABEL }}"
+
+          # Añadir comentario explicativo en la PR
+          gh pr comment "${{ github.event.pull_request.number }}" --body "
+          ## ⚠️ Actualización Major — Revisión Manual Requerida
+
+          Esta PR contiene una actualización **MAJOR** de \`${{ steps.dependabot-metadata.outputs.dependency-names }}\`.
+
+          Las actualizaciones major pueden incluir **breaking changes** que requieren:
+          - Revisar el CHANGELOG de la dependencia
+          - Actualizar el código del proyecto si hay cambios de API
+          - Ejecutar pruebas de regresión adicionales
+          - Aprobación explícita del equipo técnico
+
+          Por favor, **revisa manualmente** esta PR antes de mergearla.
+          "
+          echo "✅ Etiqueta y comentario añadidos. Saliendo sin error."
+          # Salir con código 0 para no marcar el workflow como fallido
+          exit 0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # PASO 6: Salir limpiamente si es una actualización major
+      # El step anterior ya manejó todo; este evita que los siguientes
+      # steps ejecuten el auto-merge sobre una actualización major.
+      # -----------------------------------------------------------------------
+      - name: "🚪 Salir si es actualización major"
+        if: |
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-major' &&
+          env.AUTO_MERGE_MAJOR == 'false'
+        run: |
+          echo "Actualización major procesada para revisión manual. Fin del workflow."
+          exit 0
+
+      # -----------------------------------------------------------------------
+      # PASO 7: Esperar a que los checks de CI pasen
+      # Este step es CRUCIAL: garantiza que no mergeamos código roto.
+      # La action "wait-on-check" espera a que un check específico complete.
+      #
+      # ALTERNATIVA: Si la protección de rama tiene "Require status checks"
+      # configurado Y tienes habilitado "Allow auto-merge", GitHub por sí solo
+      # esperará a que pasen los checks antes de ejecutar el merge. En ese caso,
+      # puedes omitir este step y dejar que GitHub lo maneje.
+      # -----------------------------------------------------------------------
+      - name: "⏳ Esperar checks de CI"
+        # Solo ejecutar si hay un número de PR (no en workflow_dispatch sin PR)
+        if: github.event.pull_request.number != ''
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Nombre exacto del check/job que debe pasar.
+          # Debe coincidir con el "name:" del job en tu workflow de CI.
+          # Si tienes múltiples checks, el "Allow auto-merge" de GitHub
+          # se encarga de esperar a que TODOS los requeridos pasen.
+          check-name: "🧪 Tests"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          # Tiempo de espera máximo (segundos). Ajustar según duración de tu CI.
+          wait-interval: 30        # Verificar cada 30 segundos
+          # Número máximo de intentos (30 * 60 = 30 min máximo)
+          # Descomenta para cambiar el timeout:
+          # allowed-conclusions: success,neutral,skipped
+        # Si el check falla o no existe, no bloqueamos el workflow con error
+        # (el merge no se realizará de todos modos porque GitHub lo impide)
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # PASO 8: Aprobar la Pull Request
+      # La aprobación formal es requerida si la protección de rama exige
+      # "Required approving reviews: 1" o más.
+      #
+      # IMPORTANTE: El GITHUB_TOKEN NO puede aprobar su propia PR
+      # (restricción de GitHub para evitar auto-aprobaciones). Si el workflow
+      # fue iniciado por Dependabot (que usa el token del bot), se necesita
+      # usar el token de un usuario humano o PAT.
+      #
+      # OPCIÓN A: Usar AUTOMERGE_TOKEN (PAT de cuenta de servicio) → Recomendado
+      # OPCIÓN B: Usar GITHUB_TOKEN si la protección de rama NO requiere aprobaciones
+      # -----------------------------------------------------------------------
+      - name: "✅ Aprobar PR de Dependabot"
+        # Solo aprobar si es patch o minor (major ya fue manejado arriba)
+        if: |
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-minor' ||
+          (steps.dependabot-metadata.outputs.update-type == 'version-update:semver-major' && env.AUTO_MERGE_MAJOR == 'true')
+        run: |
+          echo "✅ Aprobando PR #${{ github.event.pull_request.number }}..."
+          gh pr review "${{ github.event.pull_request.number }}" \
+            --approve \
+            --body "🤖 Auto-aprobado por el bot de Dependabot. Actualización de tipo \`${{ steps.dependabot-metadata.outputs.update-type }}\` del ecosistema \`${{ steps.dependabot-metadata.outputs.package-ecosystem }}\`."
+        env:
+          # OPCIÓN A (recomendada): Usar PAT de cuenta de servicio
+          # GH_TOKEN: ${{ secrets.AUTOMERGE_TOKEN }}
+          # OPCIÓN B: Usar GITHUB_TOKEN (funciona si no se requieren aprobaciones)
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # PASO 9: Habilitar auto-merge en la PR
+      # "gh pr merge --auto" le dice a GitHub: "fusiona esta PR automáticamente
+      # en cuanto todos los checks requeridos pasen".
+      # Si los checks ya pasaron, el merge ocurre inmediatamente.
+      #
+      # MÉTODO DE MERGE (configurable vía env.MERGE_METHOD):
+      # --squash : Combina todos los commits de la PR en uno solo (recomendado)
+      # --merge  : Crea un merge commit (preserva historial completo)
+      # --rebase : Aplica los commits de la PR sobre main (historial lineal)
+      # -----------------------------------------------------------------------
+      - name: "🔀 Habilitar auto-merge"
+        if: |
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-minor' ||
+          (steps.dependabot-metadata.outputs.update-type == 'version-update:semver-major' && env.AUTO_MERGE_MAJOR == 'true')
+        run: |
+          echo "🔀 Habilitando auto-merge (${{ env.MERGE_METHOD }}) para PR #${{ github.event.pull_request.number }}..."
+
+          # Construir el flag del método de merge dinámicamente
+          MERGE_FLAG="--${{ env.MERGE_METHOD }}"
+
+          gh pr merge "${{ github.event.pull_request.number }}" \
+            --auto \
+            $MERGE_FLAG
+
+          echo "✅ Auto-merge habilitado. GitHub fusionará la PR cuando pasen todos los checks."
+          echo "   PR: ${{ github.event.pull_request.html_url }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Si tienes protección de rama que requiere bypass:
+          # GH_TOKEN: ${{ secrets.AUTOMERGE_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # PASO 10: Añadir comentario con resumen de la acción tomada
+      # Documenta en la propia PR qué hizo el bot y por qué.
+      # -----------------------------------------------------------------------
+      - name: "💬 Comentar resultado en la PR"
+        if: |
+          success() &&
+          (steps.dependabot-metadata.outputs.update-type == 'version-update:semver-patch' ||
+           steps.dependabot-metadata.outputs.update-type == 'version-update:semver-minor')
+        run: |
+          UPDATE_TYPE="${{ steps.dependabot-metadata.outputs.update-type }}"
+          ECOSYSTEM="${{ steps.dependabot-metadata.outputs.package-ecosystem }}"
+          DEPS="${{ steps.dependabot-metadata.outputs.dependency-names }}"
+          COMPATIBLE="${{ steps.dependabot-metadata.outputs.compatible }}"
+
+          # Elegir emoji según el tipo de actualización
+          if [[ "$UPDATE_TYPE" == *"patch"* ]]; then
+            TYPE_EMOJI="🔧"
+            TYPE_LABEL="Patch"
+          else
+            TYPE_EMOJI="✨"
+            TYPE_LABEL="Minor"
+          fi
+
+          gh pr comment "${{ github.event.pull_request.number }}" --body "
+          ## 🤖 Auto-merge Activado
+
+          | Campo | Valor |
+          |-------|-------|
+          | Dependencia(s) | \`$DEPS\` |
+          | Tipo de actualización | $TYPE_EMOJI \`$TYPE_LABEL\` |
+          | Ecosistema | \`$ECOSYSTEM\` |
+          | Compatibilidad Dependabot | $COMPATIBLE |
+          | Método de merge | \`${{ env.MERGE_METHOD }}\` |
+
+          Esta PR será fusionada automáticamente cuando todos los checks de CI pasen. ✅
+          "
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # PASO 11 (OPCIONAL): Añadir etiqueta de éxito al PR
+      # -----------------------------------------------------------------------
+      - name: "🏷️ Añadir etiqueta auto-merged"
+        if: success()
+        run: |
+          gh pr edit "${{ github.event.pull_request.number }}" \
+            --add-label "auto-merged" 2>/dev/null || true
+          # El "|| true" evita que falle si la etiqueta no existe en el repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # PASO 12: Manejo de errores — notificar si el auto-merge falla
+      # -----------------------------------------------------------------------
+      - name: "❌ Notificar fallo de auto-merge"
+        if: failure()
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body "
+          ## ❌ Auto-merge Falló
+
+          El workflow de auto-merge encontró un error al procesar esta PR.
+
+          **Posibles causas:**
+          - Los checks de CI fallaron
+          - El token no tiene permisos suficientes
+          - Conflictos de fusión
+          - Protección de rama más restrictiva de lo esperado
+
+          **Acción requerida:** Por favor, revisa los [logs del workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) y fusiona manualmente.
+          " 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# =============================================================================
+# USO COMO REUSABLE WORKFLOW (workflow_call)
+# Para usar este workflow desde otro repositorio:
+#
+# jobs:
+#   auto-merge:
+#     uses: mi-org/devops-templates/.github/workflows/auto-merge-dependabot.yml@main
+#     secrets: inherit
+#
+# Para habilitar el uso como reusable, descomenta el bloque siguiente y
+# COMENTA (o elimina) el bloque "on:" de arriba:
+# =============================================================================
+# on:
+#   workflow_call:
+#     inputs:
+#       merge_method:
+#         description: "Método de merge: squash | merge | rebase"
+#         required: false
+#         default: "squash"
+#         type: string
+#       auto_merge_major:
+#         description: "Auto-mergear actualizaciones major (peligroso)"
+#         required: false
+#         default: false
+#         type: boolean
+#       target_branch:
+#         description: "Rama de destino"
+#         required: false
+#         default: "main"
+#         type: string
+#     secrets:
+#       AUTOMERGE_TOKEN:
+#         description: "PAT para saltarse restricciones de rama (opcional)"
+#         required: false

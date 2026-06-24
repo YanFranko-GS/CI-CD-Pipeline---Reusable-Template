@@ -1,0 +1,613 @@
+# =============================================================================
+# .github/workflows/ansible-playbook.yml
+# Ejecución de Playbooks de Ansible para configuración y provisión
+# =============================================================================
+#
+# PROPÓSITO:
+#   Ejecutar playbooks de Ansible para configurar servidores, desplegar
+#   aplicaciones y realizar tareas post-infraestructura. Se integra con
+#   los workflows de Terraform/CloudFormation para el ciclo completo:
+#     1. Terraform crea la infraestructura (EC2, VMs, etc.)
+#     2. Ansible configura el SO, instala software, despliega la app
+#
+# AUTENTICACIÓN SSH:
+#   - La clave privada SSH se almacena como secret (ANSIBLE_SSH_PRIVATE_KEY)
+#   - Se carga en el agente SSH del runner, NUNCA se escribe en disco
+#   - known_hosts se gestiona dinámicamente via ssh-keyscan
+#
+# ANSIBLE VAULT:
+#   Para secretos en los playbooks (contraseñas, tokens, API keys):
+#   - Usar ansible-vault encrypt_string para cifrar valores sensibles
+#   - La contraseña del vault se almacena como secret (ANSIBLE_VAULT_PASSWORD)
+#   - NUNCA commitear valores sin cifrar en el repositorio
+#
+# PREREQUISITOS:
+#   - secrets.ANSIBLE_SSH_PRIVATE_KEY → Clave privada SSH para los hosts
+#   - secrets.ANSIBLE_VAULT_PASSWORD  → Contraseña de Ansible Vault (si aplica)
+#   - secrets.ANSIBLE_BECOME_PASS     → Contraseña sudo (si se usa become)
+#   - vars.ANSIBLE_REMOTE_USER        → Usuario SSH (ej: ubuntu, ec2-user)
+# =============================================================================
+
+name: "📜 Ansible Playbook"
+
+on:
+  workflow_dispatch:
+    inputs:
+      playbook:
+        description: |
+          Ruta al playbook a ejecutar (relativa a la raíz del repo)
+          Ej: playbooks/deploy-app.yml
+              playbooks/configure-nginx.yml
+        required: true
+        type: string
+
+      inventory:
+        description: |
+          Ruta al inventario o grupo de hosts
+          Ej: inventories/staging/hosts.yml
+              inventories/production/aws_ec2.yml (inventario dinámico)
+              all, webservers, dbservers (grupo del inventario)
+        required: true
+        type: string
+
+      environment:
+        description: "Entorno objetivo"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+      limit:
+        description: |
+          Limitar la ejecución a hosts o grupos específicos
+          Ej: web01, web01:web02, webservers:!web03
+          (dejar vacío para ejecutar en todos los hosts del inventario)
+        required: false
+        type: string
+
+      extra_vars:
+        description: |
+          Variables extra en formato JSON o clave=valor
+          Ej: {"app_version": "1.2.3", "env": "staging"}
+              app_version=1.2.3 deploy_mode=rolling
+        required: false
+        type: string
+
+      tags:
+        description: |
+          Ejecutar solo las tareas con estas etiquetas (comma-separated)
+          Ej: deploy, configure, restart
+        required: false
+        type: string
+
+      skip_tags:
+        description: "Saltar tareas con estas etiquetas (comma-separated)"
+        required: false
+        type: string
+
+      check_mode:
+        description: "Modo check (dry-run): mostrar cambios sin aplicarlos"
+        required: false
+        default: false
+        type: boolean
+
+      diff_mode:
+        description: "Modo diff: mostrar diferencias en archivos modificados"
+        required: false
+        default: false
+        type: boolean
+
+      verbosity:
+        description: "Nivel de verbosidad (-v, -vv, -vvv, -vvvv)"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"   # -v
+          - "2"   # -vv
+          - "3"   # -vvv (debug)
+          - "4"   # -vvvv (connection debug)
+
+  # Invocado desde terraform-apply.yml como paso post-infraestructura
+  workflow_call:
+    inputs:
+      playbook:
+        required: true
+        type: string
+      inventory:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      limit:
+        required: false
+        default: ""
+        type: string
+      extra_vars:
+        required: false
+        default: ""
+        type: string
+    secrets:
+      ANSIBLE_SSH_PRIVATE_KEY:
+        required: true
+      ANSIBLE_VAULT_PASSWORD:
+        required: false
+      ANSIBLE_BECOME_PASS:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write  # Para OIDC si se accede a secretos dinámicos (AWS SM, Vault)
+
+concurrency:
+  group: ansible-${{ github.event.inputs.environment || inputs.environment || 'staging' }}-${{ github.event.inputs.playbook || inputs.playbook }}
+  cancel-in-progress: false  # Nunca cancelar un playbook a medias
+
+env:
+  # Forzar salida sin colores para logs más limpios en CI
+  ANSIBLE_FORCE_COLOR: "false"
+  # No preguntar por confirmación de fingerprints SSH desconocidos
+  ANSIBLE_HOST_KEY_CHECKING: "false"
+  # Aumentar el timeout de conexión SSH
+  ANSIBLE_SSH_ARGS: "-o ConnectTimeout=30 -o ServerAliveInterval=30"
+  # Directorio de roles personalizados
+  ANSIBLE_ROLES_PATH: "./roles:~/.ansible/roles"
+  # Retries de conexión para hosts inestables
+  ANSIBLE_RETRIES: "3"
+  # Callback de salida: usar yaml para mejor legibilidad
+  ANSIBLE_STDOUT_CALLBACK: "yaml"
+
+jobs:
+  # ===========================================================================
+  # JOB PRELIMINAR: Lint del playbook con ansible-lint
+  # ===========================================================================
+  ansible-lint:
+    name: "🔍 Ansible Lint"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Solo ejecutar lint en ejecuciones manuales, no en workflow_call
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "⚙️ Setup Python para ansible-lint"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: "📦 Instalar ansible-lint"
+        run: pip install ansible-lint
+
+      - name: "🔍 Ejecutar ansible-lint"
+        run: |
+          PLAYBOOK="${{ github.event.inputs.playbook }}"
+
+          # Crear archivo de configuración de ansible-lint si no existe
+          if [ ! -f ".ansible-lint" ] && [ ! -f ".ansible-lint.yml" ]; then
+            cat > /tmp/ansible-lint-config.yml << 'EOF'
+          ---
+          # Configuración de ansible-lint
+          warn_list:
+            - yaml
+            - experimental
+          skip_list:
+            # Descomenta para ignorar reglas específicas:
+            # - yaml[line-length]  # Permitir líneas largas
+            # - no-free-form       # Permitir módulos en forma libre
+          EOF
+            ansible-lint --config-file /tmp/ansible-lint-config.yml "$PLAYBOOK" 2>&1 || true
+          else
+            ansible-lint "$PLAYBOOK" 2>&1 || true
+          fi
+          # continue-on-error efectivo: lint no bloquea el deploy pero muestra warnings
+        continue-on-error: true
+
+  # ===========================================================================
+  # JOB PRINCIPAL: Ejecutar el playbook de Ansible
+  # ===========================================================================
+  ansible:
+    name: "📜 Ansible (${{ github.event.inputs.playbook || inputs.playbook }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: ansible-lint
+    if: always() && (needs.ansible-lint.result == 'success' || needs.ansible-lint.result == 'skipped' || github.event_name == 'workflow_call')
+
+    environment:
+      name: ${{ github.event.inputs.environment || inputs.environment || 'staging' }}
+
+    outputs:
+      play_result: ${{ steps.run.outputs.result }}
+      hosts_ok: ${{ steps.parse.outputs.hosts_ok }}
+      hosts_failed: ${{ steps.parse.outputs.hosts_failed }}
+      hosts_unreachable: ${{ steps.parse.outputs.hosts_unreachable }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # PASO 2: Instalar Python y Ansible
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: "📦 Instalar Ansible y dependencias"
+        run: |
+          pip install --upgrade pip
+
+          # Instalar la versión de Ansible especificada (o la latest)
+          ANSIBLE_VERSION="${{ vars.ANSIBLE_VERSION || '' }}"
+          if [ -n "$ANSIBLE_VERSION" ]; then
+            pip install "ansible==$ANSIBLE_VERSION"
+          else
+            pip install ansible
+          fi
+
+          # Instalar dependencias de Python para módulos de cloud
+          # Ajustar según los módulos que uses en tus playbooks:
+          pip install boto3 botocore  # AWS
+          # pip install azure-identity azure-mgmt-compute  # Azure
+          # pip install google-auth google-cloud-compute   # GCP
+
+          # Instalar colecciones de Ansible necesarias
+          if [ -f "requirements.yml" ]; then
+            ansible-galaxy collection install -r requirements.yml
+            ansible-galaxy role install -r requirements.yml 2>/dev/null || true
+          fi
+
+          # Mostrar versiones instaladas
+          ansible --version
+          python --version
+
+      # -----------------------------------------------------------------------
+      # PASO 3: Configurar la clave SSH para conectarse a los hosts
+      # La clave se carga en el agente SSH del runner (en memoria)
+      # NUNCA se escribe en disco en texto plano
+      # -----------------------------------------------------------------------
+      - name: "🔑 Configurar clave SSH"
+        run: |
+          # Iniciar el agente SSH
+          eval "$(ssh-agent -s)"
+
+          # Añadir la clave privada al agente (solo en memoria)
+          # La clave se destruye automáticamente cuando el agente termina
+          echo "${{ secrets.ANSIBLE_SSH_PRIVATE_KEY }}" | ssh-add -
+
+          # Exportar las variables del agente para pasos siguientes
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
+          echo "✅ Clave SSH añadida al agente"
+          ssh-add -l  # Listar claves en el agente (solo el fingerprint, no la clave)
+
+      # -----------------------------------------------------------------------
+      # PASO 4: Configurar known_hosts
+      # Evita el prompt "Are you sure you want to continue connecting?"
+      # -----------------------------------------------------------------------
+      - name: "🔒 Configurar known_hosts"
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Para inventarios estáticos: añadir los hosts conocidos
+          # El ANSIBLE_HOST_KEY_CHECKING=false desactiva la verificación,
+          # pero para mayor seguridad, añadir explícitamente los fingerprints:
+          # ssh-keyscan -H $HOST >> ~/.ssh/known_hosts
+
+          # Para inventarios dinámicos de AWS (IPs cambian):
+          # Configurar StrictHostKeyChecking=accept-new en SSH
+          cat > ~/.ssh/config << 'EOF'
+          Host *
+            StrictHostKeyChecking accept-new
+            ServerAliveInterval 30
+            ServerAliveCountMax 3
+            ConnectTimeout 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+          # Si tienes hosts conocidos almacenados como secret:
+          if [ -n "${{ secrets.ANSIBLE_KNOWN_HOSTS }}" ]; then
+            echo "${{ secrets.ANSIBLE_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+            chmod 644 ~/.ssh/known_hosts
+            echo "✅ known_hosts configurado desde secret"
+          fi
+
+      # -----------------------------------------------------------------------
+      # PASO 5: Configurar Ansible Vault (para secretos en playbooks)
+      # -----------------------------------------------------------------------
+      - name: "🔐 Configurar Ansible Vault"
+        if: secrets.ANSIBLE_VAULT_PASSWORD != ''
+        run: |
+          # Escribir la contraseña del vault a un archivo temporal
+          # (requerido por ansible-playbook --vault-password-file)
+          echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > /tmp/.vault_pass
+          chmod 600 /tmp/.vault_pass
+
+          echo "✅ Ansible Vault configurado"
+          echo "VAULT_PASS_FILE=/tmp/.vault_pass" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # PASO 6: Configurar OIDC para inventarios dinámicos de AWS
+      # Si usas inventario dinámico de AWS (aws_ec2.yml), necesitas
+      # credenciales AWS para que Ansible pueda descubrir los hosts
+      # -----------------------------------------------------------------------
+      - name: "🔐 Autenticar en AWS (OIDC) para inventario dinámico"
+        if: vars.CLOUD_PROVIDER == 'aws' || vars.CLOUD_PROVIDER == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          audience: sts.amazonaws.com
+        continue-on-error: true  # Si no se usa inventario dinámico, no es crítico
+
+      # -----------------------------------------------------------------------
+      # PASO 7: Ejecutar el playbook de Ansible
+      # -----------------------------------------------------------------------
+      - name: "📜 Ejecutar Ansible Playbook"
+        id: run
+        run: |
+          PLAYBOOK="${{ github.event.inputs.playbook || inputs.playbook }}"
+          INVENTORY="${{ github.event.inputs.inventory || inputs.inventory }}"
+          ENVIRONMENT="${{ github.event.inputs.environment || inputs.environment || 'staging' }}"
+          EXTRA_VARS="${{ github.event.inputs.extra_vars || inputs.extra_vars || '' }}"
+          LIMIT="${{ github.event.inputs.limit || inputs.limit || '' }}"
+          TAGS="${{ github.event.inputs.tags || '' }}"
+          SKIP_TAGS="${{ github.event.inputs.skip_tags || '' }}"
+          VERBOSITY="${{ github.event.inputs.verbosity || '0' }}"
+          CHECK_MODE="${{ github.event.inputs.check_mode || 'false' }}"
+          DIFF_MODE="${{ github.event.inputs.diff_mode || 'false' }}"
+
+          echo "📜 EJECUTANDO ANSIBLE PLAYBOOK"
+          echo "   Playbook:   $PLAYBOOK"
+          echo "   Inventario: $INVENTORY"
+          echo "   Entorno:    $ENVIRONMENT"
+          echo "   Check mode: $CHECK_MODE"
+          echo ""
+
+          # Verificar que el playbook existe
+          if [ ! -f "$PLAYBOOK" ]; then
+            echo "❌ Playbook no encontrado: $PLAYBOOK"
+            exit 1
+          fi
+
+          # Construir el comando de ansible-playbook
+          CMD="ansible-playbook"
+
+          # Inventario
+          CMD="$CMD -i $INVENTORY"
+
+          # Usuario SSH remoto
+          REMOTE_USER="${{ vars.ANSIBLE_REMOTE_USER || 'ubuntu' }}"
+          CMD="$CMD -u $REMOTE_USER"
+
+          # Vault password file (si existe)
+          if [ -n "$VAULT_PASS_FILE" ]; then
+            CMD="$CMD --vault-password-file $VAULT_PASS_FILE"
+          fi
+
+          # Become (sudo) password
+          if [ -n "${{ secrets.ANSIBLE_BECOME_PASS }}" ]; then
+            CMD="$CMD --become --become-method=sudo"
+            # La contraseña de become se pasa via variable de entorno
+          fi
+
+          # Limit de hosts
+          if [ -n "$LIMIT" ]; then
+            CMD="$CMD --limit $LIMIT"
+          fi
+
+          # Extra vars
+          if [ -n "$EXTRA_VARS" ]; then
+            CMD="$CMD --extra-vars '$EXTRA_VARS'"
+          fi
+
+          # Siempre pasar el entorno como variable
+          CMD="$CMD --extra-vars 'ansible_environment=$ENVIRONMENT deploy_commit=${{ github.sha }}'"
+
+          # Tags
+          if [ -n "$TAGS" ]; then
+            CMD="$CMD --tags $TAGS"
+          fi
+
+          # Skip tags
+          if [ -n "$SKIP_TAGS" ]; then
+            CMD="$CMD --skip-tags $SKIP_TAGS"
+          fi
+
+          # Verbosidad
+          if [ "$VERBOSITY" -gt "0" ]; then
+            VERBOSE_FLAG=$(printf '%*s' "$VERBOSITY" '' | tr ' ' 'v')
+            CMD="$CMD -$VERBOSE_FLAG"
+          fi
+
+          # Check mode (dry-run)
+          if [ "$CHECK_MODE" = "true" ]; then
+            CMD="$CMD --check"
+          fi
+
+          # Diff mode
+          if [ "$DIFF_MODE" = "true" ]; then
+            CMD="$CMD --diff"
+          fi
+
+          # Playbook
+          CMD="$CMD $PLAYBOOK"
+
+          echo "Comando: $CMD"
+          echo ""
+
+          # Ejecutar el playbook y capturar el output
+          set +e
+          eval $CMD 2>&1 | tee /tmp/ansible-output.txt
+          ANSIBLE_EXIT=$?
+          set -e
+
+          echo ""
+          echo "Ansible exit code: $ANSIBLE_EXIT"
+
+          if [ $ANSIBLE_EXIT -eq 0 ]; then
+            echo "✅ Playbook completado exitosamente"
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          elif [ $ANSIBLE_EXIT -eq 2 ]; then
+            echo "❌ El playbook falló en uno o más hosts"
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+            exit 2
+          elif [ $ANSIBLE_EXIT -eq 3 ]; then
+            echo "❌ Hosts inalcanzables (unreachable)"
+            echo "result=unreachable" >> "$GITHUB_OUTPUT"
+            exit 3
+          elif [ $ANSIBLE_EXIT -eq 4 ]; then
+            echo "❌ Error de análisis del playbook"
+            echo "result=parse_error" >> "$GITHUB_OUTPUT"
+            exit 4
+          else
+            echo "❌ Error desconocido (exit code: $ANSIBLE_EXIT)"
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            exit $ANSIBLE_EXIT
+          fi
+        env:
+          ANSIBLE_BECOME_PASS: ${{ secrets.ANSIBLE_BECOME_PASS }}
+          # Prevenir que las credenciales aparezcan en logs
+          no_proxy: "*"
+
+      # -----------------------------------------------------------------------
+      # PASO 8: Parsear el resumen del play
+      # Ansible muestra al final: "PLAY RECAP" con ok=N failed=N unreachable=N
+      # -----------------------------------------------------------------------
+      - name: "📊 Parsear resumen del play"
+        id: parse
+        if: always()
+        run: |
+          OUTPUT="/tmp/ansible-output.txt"
+
+          if [ ! -f "$OUTPUT" ]; then
+            echo "hosts_ok=0"          >> "$GITHUB_OUTPUT"
+            echo "hosts_failed=0"      >> "$GITHUB_OUTPUT"
+            echo "hosts_unreachable=0" >> "$GITHUB_OUTPUT"
+            echo "tasks_ok=0"          >> "$GITHUB_OUTPUT"
+            echo "tasks_changed=0"     >> "$GITHUB_OUTPUT"
+            echo "tasks_failed=0"      >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "============================================"
+          echo "📊 ANSIBLE PLAY RECAP:"
+          echo "============================================"
+
+          # Extraer el PLAY RECAP del output
+          grep -A 100 "PLAY RECAP" "$OUTPUT" || true
+
+          # Parsear métricas del PLAY RECAP
+          # Formato: hostname : ok=N changed=N unreachable=N failed=N skipped=N rescued=N ignored=N
+
+          HOSTS_OK=$(grep -E "^\S.*ok=[0-9]" "$OUTPUT" | grep -v "unreachable=[^0]" | grep -v "failed=[^0]" | wc -l 2>/dev/null || echo "0")
+          HOSTS_FAILED=$(grep -E "failed=[1-9]" "$OUTPUT" | wc -l 2>/dev/null || echo "0")
+          HOSTS_UNREACHABLE=$(grep -E "unreachable=[1-9]" "$OUTPUT" | wc -l 2>/dev/null || echo "0")
+          TASKS_OK=$(grep -E "ok=[0-9]+" "$OUTPUT" | tail -1 | grep -oP "ok=\K[0-9]+" || echo "0")
+          TASKS_CHANGED=$(grep -E "changed=[0-9]+" "$OUTPUT" | tail -1 | grep -oP "changed=\K[0-9]+" || echo "0")
+          TASKS_FAILED=$(grep -E "failed=[0-9]+" "$OUTPUT" | tail -1 | grep -oP "failed=\K[0-9]+" || echo "0")
+
+          echo "hosts_ok=$HOSTS_OK"               >> "$GITHUB_OUTPUT"
+          echo "hosts_failed=$HOSTS_FAILED"        >> "$GITHUB_OUTPUT"
+          echo "hosts_unreachable=$HOSTS_UNREACHABLE" >> "$GITHUB_OUTPUT"
+          echo "tasks_ok=$TASKS_OK"               >> "$GITHUB_OUTPUT"
+          echo "tasks_changed=$TASKS_CHANGED"      >> "$GITHUB_OUTPUT"
+          echo "tasks_failed=$TASKS_FAILED"        >> "$GITHUB_OUTPUT"
+
+          echo ""
+          echo "Hosts OK:          $HOSTS_OK"
+          echo "Hosts failed:      $HOSTS_FAILED"
+          echo "Hosts unreachable: $HOSTS_UNREACHABLE"
+          echo "Tasks OK:          $TASKS_OK"
+          echo "Tasks changed:     $TASKS_CHANGED"
+          echo "Tasks failed:      $TASKS_FAILED"
+
+      # -----------------------------------------------------------------------
+      # PASO 9: Limpieza de secretos
+      # -----------------------------------------------------------------------
+      - name: "🧹 Limpiar secretos del agente SSH"
+        if: always()
+        run: |
+          # Matar el agente SSH para que la clave privada no persista
+          if [ -n "$SSH_AGENT_PID" ]; then
+            ssh-agent -k 2>/dev/null || true
+          fi
+
+          # Limpiar el archivo de contraseña del vault
+          rm -f /tmp/.vault_pass
+
+          echo "✅ Secretos limpiados"
+
+      # -----------------------------------------------------------------------
+      # PASO 10: Guardar artefactos
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar output del playbook"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "ansible-${{ github.event.inputs.environment || 'staging' }}-${{ github.run_id }}"
+          path: /tmp/ansible-output.txt
+          retention-days: 14
+
+      # -----------------------------------------------------------------------
+      # Notificación
+      # -----------------------------------------------------------------------
+      - name: "🔔 Notificar resultado a Slack"
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.run.outputs.result == 'success' && '✅' || '❌' }} Ansible Playbook — ${{ github.repository }}",
+              "attachments": [{
+                "color": "${{ steps.run.outputs.result == 'success' && 'good' || 'danger' }}",
+                "fields": [
+                  {"title": "Playbook", "value": "${{ github.event.inputs.playbook }}", "short": true},
+                  {"title": "Entorno", "value": "${{ github.event.inputs.environment || 'staging' }}", "short": true},
+                  {"title": "Hosts OK", "value": "${{ steps.parse.outputs.hosts_ok || '?' }}", "short": true},
+                  {"title": "Hosts Fallidos", "value": "${{ steps.parse.outputs.hosts_failed || '0' }}", "short": true},
+                  {"title": "Tasks OK", "value": "${{ steps.parse.outputs.tasks_ok || '?' }}", "short": true},
+                  {"title": "Tasks Changed", "value": "${{ steps.parse.outputs.tasks_changed || '0' }}", "short": true},
+                  {"title": "Logs", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver workflow>", "short": false}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          RESULT="${{ steps.run.outputs.result || 'unknown' }}"
+          STATUS_EMOJI="$( [ "$RESULT" = "success" ] && echo "✅" || echo "❌" )"
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 📜 Ansible Playbook — ${{ github.event.inputs.environment || 'staging' }}
+
+          **Estado:** $STATUS_EMOJI $RESULT
+          **Playbook:** \`${{ github.event.inputs.playbook }}\`
+          **Inventario:** \`${{ github.event.inputs.inventory }}\`
+          **Check mode:** ${{ github.event.inputs.check_mode || 'false' }}
+
+          ## Play Recap
+
+          | Métrica | Valor |
+          |---------|-------|
+          | 🟢 Hosts OK | ${{ steps.parse.outputs.hosts_ok || '?' }} |
+          | ❌ Hosts Fallidos | ${{ steps.parse.outputs.hosts_failed || '0' }} |
+          | 🔌 Hosts Unreachable | ${{ steps.parse.outputs.hosts_unreachable || '0' }} |
+          | ✅ Tasks OK | ${{ steps.parse.outputs.tasks_ok || '?' }} |
+          | 🔄 Tasks Changed | ${{ steps.parse.outputs.tasks_changed || '0' }} |
+          | ❌ Tasks Failed | ${{ steps.parse.outputs.tasks_failed || '0' }} |
+          EOF

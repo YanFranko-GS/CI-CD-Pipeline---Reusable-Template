@@ -1,0 +1,810 @@
+# =============================================================================
+# .github/workflows/api-docs.yml
+# Generación automática de especificaciones y portales de API
+# Módulo 8 de la Suite DevOps
+# =============================================================================
+#
+# PROPÓSITO:
+#   Extraer, validar y publicar especificaciones de API automáticamente:
+#   - OpenAPI/Swagger desde Express, FastAPI, Spring Boot, NestJS
+#   - GraphQL Schema desde graphql-js, Apollo, Strawberry
+#   - gRPC protobuf → HTML con protoc-gen-doc
+#
+# OUTPUTS:
+#   - openapi.json / openapi.yaml (spec estándar)
+#   - Portal interactivo Swagger UI o Redoc
+#   - Colección de Postman (opcional)
+#
+# PREREQUISITOS:
+#   Igual que deploy-docs.yml (NETLIFY_AUTH_TOKEN, etc.)
+#   Adicionales:
+#     vars.API_FRAMEWORK  → "express", "fastapi", "springdoc", "nestjs", "graphql"
+#     vars.API_OUTPUT_FORMAT → "yaml" | "json"
+# =============================================================================
+
+name: "🔌 Generate API Docs"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "routes/**"
+      - "api/**"
+      - "schemas/**"
+      - "*.proto"                 # Archivos protobuf
+      - "openapi.yaml"
+      - "openapi.json"
+      - "swagger.yaml"
+      - "swagger.json"
+      - "graphql/**"
+      - ".github/workflows/api-docs.yml"
+    paths-ignore:
+      - "src/**/*.test.*"
+      - "src/**/*.spec.*"
+
+  workflow_dispatch:
+    inputs:
+      api_type:
+        description: |
+          Tipo de API a documentar:
+          • openapi  → REST API con especificación OpenAPI 3.x
+          • graphql  → API GraphQL (schema + playground)
+          • grpc     → Servicios gRPC (protobuf)
+        required: true
+        default: "openapi"
+        type: choice
+        options:
+          - openapi
+          - graphql
+          - grpc
+
+      framework:
+        description: |
+          Framework del servidor API:
+          OpenAPI: express, fastapi, springdoc, nestjs, django-rest, laravel
+          GraphQL: graphql-js, apollo, strawberry, pothos
+          gRPC:    proto-files
+        required: false
+        default: "auto-detect"
+        type: string
+
+      output_format:
+        description: "Formato de salida de la especificación"
+        required: false
+        default: "yaml"
+        type: choice
+        options:
+          - yaml
+          - json
+
+      deploy_target:
+        description: "Destino de publicación del portal de API"
+        required: false
+        default: "github_pages"
+        type: choice
+        options:
+          - github_pages
+          - netlify
+          - vercel
+          - artifact-only   # Solo guardar como artefacto, sin publicar
+
+      generate_portal:
+        description: "Generar portal interactivo (Swagger UI o Redoc)"
+        required: false
+        default: true
+        type: boolean
+
+      portal_type:
+        description: "Tipo de portal interactivo"
+        required: false
+        default: "redoc"
+        type: choice
+        options:
+          - redoc         # Más elegante, mejor para docs públicas
+          - swagger-ui    # Más funcional, permite probar la API
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: api-docs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  API_TYPE: ${{ github.event.inputs.api_type || vars.API_TYPE || 'openapi' }}
+  FRAMEWORK: ${{ github.event.inputs.framework || vars.API_FRAMEWORK || 'auto-detect' }}
+  OUTPUT_FORMAT: ${{ github.event.inputs.output_format || vars.API_OUTPUT_FORMAT || 'yaml' }}
+  DEPLOY_TARGET: ${{ github.event.inputs.deploy_target || vars.DOCS_DEPLOY_TARGET || 'github_pages' }}
+  PORTAL_TYPE: ${{ github.event.inputs.portal_type || vars.API_PORTAL_TYPE || 'redoc' }}
+
+jobs:
+  generate-api-docs:
+    name: "🔌 Generate & Deploy API Docs"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy_pages.outputs.page_url }}
+
+    outputs:
+      spec_file: ${{ steps.generate.outputs.spec_file }}
+      docs_url: ${{ steps.deploy_pages.outputs.page_url }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # PASO 1: Detectar el framework si no se especificó
+      # -----------------------------------------------------------------------
+      - name: "🔍 Detectar framework API"
+        id: detect_framework
+        run: |
+          FRAMEWORK="${{ env.FRAMEWORK }}"
+
+          if [ "$FRAMEWORK" != "auto-detect" ]; then
+            echo "framework=$FRAMEWORK" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "🔍 Auto-detectando framework de API..."
+
+          # Node.js frameworks
+          if [ -f "package.json" ]; then
+            if grep -q '"express"' package.json 2>/dev/null; then
+              # Verificar si usa swagger-jsdoc
+              if grep -q '"swagger-jsdoc"\|"swagger-ui-express"\|"@nestjs/swagger"' package.json 2>/dev/null; then
+                FRAMEWORK="express"
+                echo "  ✅ Express + swagger-jsdoc detectado"
+              fi
+            fi
+            if grep -q '"@nestjs/core"' package.json 2>/dev/null; then
+              FRAMEWORK="nestjs"
+              echo "  ✅ NestJS detectado"
+            fi
+            if grep -q '"graphql"\|"apollo-server"\|"@apollo/server"' package.json 2>/dev/null; then
+              FRAMEWORK="graphql-js"
+              echo "  ✅ GraphQL (Node.js) detectado"
+            fi
+          fi
+
+          # Python frameworks
+          if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            if grep -q "fastapi" requirements.txt pyproject.toml 2>/dev/null; then
+              FRAMEWORK="fastapi"
+              echo "  ✅ FastAPI detectado"
+            elif grep -q "strawberry-graphql\|strawberry" requirements.txt pyproject.toml 2>/dev/null; then
+              FRAMEWORK="strawberry"
+              echo "  ✅ Strawberry GraphQL (Python) detectado"
+            elif grep -q "djangorestframework\|drf-spectacular" requirements.txt pyproject.toml 2>/dev/null; then
+              FRAMEWORK="django-rest"
+              echo "  ✅ Django REST Framework detectado"
+            fi
+          fi
+
+          # Java frameworks
+          if [ -f "pom.xml" ]; then
+            if grep -q "springdoc\|springfox" pom.xml 2>/dev/null; then
+              FRAMEWORK="springdoc"
+              echo "  ✅ SpringDoc OpenAPI detectado"
+            fi
+          fi
+
+          # gRPC: buscar archivos .proto
+          if find . -name "*.proto" -not -path "*/vendor/*" | grep -q .; then
+            FRAMEWORK="grpc"
+            echo "  ✅ gRPC (archivos .proto) detectado"
+          fi
+
+          # Si existe directamente el spec file
+          if [ -f "openapi.yaml" ] || [ -f "openapi.json" ] || [ -f "swagger.yaml" ]; then
+            FRAMEWORK="spec-file"
+            echo "  ✅ Archivo de especificación OpenAPI directo detectado"
+          fi
+
+          if [ -z "$FRAMEWORK" ]; then
+            echo "⚠️ No se detectó ningún framework. Buscando spec file..."
+            FRAMEWORK="spec-file"
+          fi
+
+          echo "framework=$FRAMEWORK" >> "$GITHUB_OUTPUT"
+          echo "Framework detectado: $FRAMEWORK"
+
+      # =======================================================================
+      # GENERACIÓN: OPENAPI
+      # =======================================================================
+
+      # -----------------------------------------------------------------------
+      # Express + swagger-jsdoc
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Node.js (Express/NestJS/GraphQL)"
+        if: contains(fromJSON('["express","nestjs","graphql-js","spec-file"]'), steps.detect_framework.outputs.framework)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: "📦 Instalar dependencias (Node)"
+        if: contains(fromJSON('["express","nestjs","graphql-js"]'), steps.detect_framework.outputs.framework)
+        run: npm ci --prefer-offline
+
+      - name: "📋 Generar OpenAPI desde Express+swagger-jsdoc"
+        id: gen_express
+        if: steps.detect_framework.outputs.framework == 'express'
+        run: |
+          FORMAT="${{ env.OUTPUT_FORMAT }}"
+          OUTPUT_FILE="api-spec.${FORMAT}"
+
+          # Script estándar de extracción de OpenAPI para Express
+          # El proyecto debe tener un script 'generate-spec' o similar
+          if npm run generate-spec 2>/dev/null; then
+            echo "✅ Spec generado via npm run generate-spec"
+          else
+            # Script de extracción genérico (ajustar a tu proyecto)
+            cat > /tmp/extract-openapi.js << 'SCRIPT'
+const swaggerJsdoc = require('swagger-jsdoc');
+const fs = require('fs');
+const yaml = require('js-yaml');
+
+// Configuración del swagger-jsdoc (buscar en el código del proyecto)
+let options;
+try {
+  // Intentar importar la configuración existente
+  options = require('./src/config/swagger');
+} catch {
+  // Configuración mínima de fallback
+  options = {
+    definition: {
+      openapi: '3.0.0',
+      info: {
+        title: process.env.npm_package_name || 'API',
+        version: process.env.npm_package_version || '1.0.0',
+      },
+    },
+    apis: ['./src/routes/**/*.js', './src/routes/**/*.ts',
+           './src/**/*.js', './src/**/*.ts'],
+  };
+}
+
+const spec = swaggerJsdoc(options);
+const format = process.argv[2] || 'yaml';
+
+if (format === 'json') {
+  fs.writeFileSync('api-spec.json', JSON.stringify(spec, null, 2));
+} else {
+  fs.writeFileSync('api-spec.yaml', yaml.dump(spec));
+}
+console.log(`✅ OpenAPI spec generado: api-spec.${format}`);
+SCRIPT
+            npm install --no-save swagger-jsdoc js-yaml 2>/dev/null
+            node /tmp/extract-openapi.js "$FORMAT"
+          fi
+
+          # Verificar que el spec fue generado
+          if [ ! -f "$OUTPUT_FILE" ]; then
+            # Buscar cualquier spec generado
+            FOUND=$(find . -name "openapi.*" -o -name "swagger.*" -o -name "api-spec.*" | \
+              grep -v node_modules | grep -v ".github" | head -1)
+            if [ -n "$FOUND" ]; then
+              cp "$FOUND" "$OUTPUT_FILE"
+              echo "✅ Spec encontrado en: $FOUND"
+            else
+              echo "❌ No se encontró el archivo de especificación generado"
+              exit 1
+            fi
+          fi
+
+          echo "spec_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+          echo "✅ Spec Express generado: $OUTPUT_FILE"
+
+      - name: "📋 Generar OpenAPI desde NestJS"
+        id: gen_nestjs
+        if: steps.detect_framework.outputs.framework == 'nestjs'
+        run: |
+          FORMAT="${{ env.OUTPUT_FORMAT }}"
+          OUTPUT_FILE="api-spec.${FORMAT}"
+
+          # NestJS con @nestjs/swagger tiene el plugin swagger
+          # Intentar el script de generación del proyecto
+          if npm run generate:api-docs 2>/dev/null || \
+             npm run swagger:generate 2>/dev/null || \
+             npm run docs:generate 2>/dev/null; then
+            echo "✅ API docs generadas via npm script"
+          else
+            # Script de extracción para NestJS
+            cat > /tmp/extract-nestjs.ts << 'SCRIPT'
+import { NestFactory } from '@nestjs/core';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { writeFileSync } from 'fs';
+import * as yaml from 'js-yaml';
+import { AppModule } from './src/app.module';
+
+async function generate() {
+  const app = await NestFactory.create(AppModule, { logger: false });
+  const config = new DocumentBuilder()
+    .setTitle(process.env.npm_package_name || 'API')
+    .setVersion(process.env.npm_package_version || '1.0.0')
+    .build();
+  const document = SwaggerModule.createDocument(app, config);
+  const format = process.argv[2] || 'yaml';
+  if (format === 'json') {
+    writeFileSync('api-spec.json', JSON.stringify(document, null, 2));
+  } else {
+    writeFileSync('api-spec.yaml', yaml.dump(document));
+  }
+  await app.close();
+}
+generate();
+SCRIPT
+            npx ts-node /tmp/extract-nestjs.ts "$FORMAT" 2>/dev/null || \
+              echo "⚠️ No se pudo auto-generar el spec de NestJS. Verifica la configuración."
+          fi
+
+          # Buscar el spec generado
+          FOUND=$(find . -name "api-spec.*" -o -name "openapi.*" -o -name "swagger.*" | \
+            grep -v node_modules | head -1)
+          if [ -n "$FOUND" ]; then
+            cp "$FOUND" "$OUTPUT_FILE" 2>/dev/null || true
+          fi
+
+          echo "spec_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # FastAPI (Python)
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Python (FastAPI/Django)"
+        if: contains(fromJSON('["fastapi","django-rest","strawberry"]'), steps.detect_framework.outputs.framework)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: "📦 Instalar dependencias Python"
+        if: contains(fromJSON('["fastapi","django-rest","strawberry"]'), steps.detect_framework.outputs.framework)
+        run: |
+          pip install --upgrade pip
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
+          # Instalar herramientas de exportación
+          pip install pyyaml 2>/dev/null || true
+
+      - name: "📋 Generar OpenAPI desde FastAPI"
+        id: gen_fastapi
+        if: steps.detect_framework.outputs.framework == 'fastapi'
+        run: |
+          FORMAT="${{ env.OUTPUT_FORMAT }}"
+          OUTPUT_FILE="api-spec.${FORMAT}"
+
+          # Script estándar de extracción de OpenAPI para FastAPI
+          # FastAPI genera el spec automáticamente desde las anotaciones de tipo
+          cat > /tmp/extract_fastapi.py << 'SCRIPT'
+import json
+import sys
+import yaml
+
+# Importar la app de FastAPI del proyecto
+# Ajustar el import según la estructura del proyecto
+try:
+    from main import app          # Si main.py está en la raíz
+except ImportError:
+    try:
+        from src.main import app  # Si está en src/
+    except ImportError:
+        try:
+            from app.main import app  # Si está en app/
+        except ImportError:
+            print("❌ No se pudo importar la app FastAPI")
+            print("   Crea un script 'extract_openapi.py' en la raíz con:")
+            print("   from tu_modulo import app")
+            sys.exit(1)
+
+# Obtener el spec OpenAPI
+spec = app.openapi()
+output_format = sys.argv[1] if len(sys.argv) > 1 else 'yaml'
+output_file = f"api-spec.{output_format}"
+
+if output_format == 'json':
+    with open(output_file, 'w') as f:
+        json.dump(spec, f, indent=2)
+else:
+    with open(output_file, 'w') as f:
+        yaml.dump(spec, f, default_flow_style=False, allow_unicode=True)
+
+print(f"✅ OpenAPI spec generado: {output_file}")
+SCRIPT
+
+          # Intentar el script de extracción del proyecto primero
+          if [ -f "extract_openapi.py" ]; then
+            python extract_openapi.py "$FORMAT"
+          else
+            python /tmp/extract_fastapi.py "$FORMAT"
+          fi
+
+          if [ ! -f "$OUTPUT_FILE" ]; then
+            echo "❌ No se pudo generar el spec de FastAPI"
+            exit 1
+          fi
+
+          echo "spec_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+          echo "✅ OpenAPI FastAPI generado: $OUTPUT_FILE"
+
+      - name: "📋 Generar OpenAPI desde Django REST Framework"
+        id: gen_django
+        if: steps.detect_framework.outputs.framework == 'django-rest'
+        run: |
+          FORMAT="${{ env.OUTPUT_FORMAT }}"
+          OUTPUT_FILE="api-spec.${FORMAT}"
+
+          # drf-spectacular es la herramienta estándar para DRF
+          pip install drf-spectacular 2>/dev/null || true
+
+          # Exportar el schema via manage.py
+          python manage.py spectacular \
+            --color \
+            --file "$OUTPUT_FILE" \
+            $( [ "$FORMAT" = "json" ] && echo "--format json" || echo "" ) \
+            2>/dev/null || \
+          python manage.py generateschema \
+            --file "$OUTPUT_FILE" \
+            2>/dev/null
+
+          echo "spec_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Spring Boot + SpringDoc OpenAPI (Java)
+      # -----------------------------------------------------------------------
+      - name: "⚙️ Setup Java (SpringDoc)"
+        if: steps.detect_framework.outputs.framework == 'springdoc'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "maven"
+
+      - name: "📋 Generar OpenAPI desde Spring Boot + SpringDoc"
+        id: gen_springdoc
+        if: steps.detect_framework.outputs.framework == 'springdoc'
+        run: |
+          FORMAT="${{ env.OUTPUT_FORMAT }}"
+          OUTPUT_FILE="api-spec.${FORMAT}"
+
+          # SpringDoc puede generar el spec durante el test con springdoc-openapi-maven-plugin
+          # O podemos arrancar la app y hacer GET /v3/api-docs
+          mvn \
+            springdoc-openapi:generate \
+            -Dspringdoc.outputDir=. \
+            -Dspringdoc.outputFileName="$OUTPUT_FILE" \
+            --no-transfer-progress \
+            -q 2>/dev/null || \
+          # Alternativa: iniciar la app y extraer el spec
+          (
+            mvn spring-boot:run -DskipTests &
+            APP_PID=$!
+            sleep 30  # Esperar a que arranque
+            curl -sf "http://localhost:8080/v3/api-docs" -o "api-spec.json"
+            [ "$FORMAT" = "yaml" ] && \
+              curl -sf "http://localhost:8080/v3/api-docs.yaml" -o "api-spec.yaml"
+            kill $APP_PID 2>/dev/null
+          )
+
+          echo "spec_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Spec file directo (si ya existe openapi.yaml/json en el repo)
+      # -----------------------------------------------------------------------
+      - name: "📋 Usar spec file existente"
+        id: gen_spec_file
+        if: steps.detect_framework.outputs.framework == 'spec-file'
+        run: |
+          FORMAT="${{ env.OUTPUT_FORMAT }}"
+          OUTPUT_FILE="api-spec.${FORMAT}"
+
+          # Buscar el spec file existente
+          for CANDIDATE in "openapi.yaml" "openapi.json" "swagger.yaml" "swagger.json" \
+                           "api/openapi.yaml" "api/openapi.json" "docs/openapi.yaml"; do
+            if [ -f "$CANDIDATE" ]; then
+              cp "$CANDIDATE" "$OUTPUT_FILE"
+              echo "✅ Usando spec existente: $CANDIDATE"
+              echo "spec_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+
+          if [ ! -f "$OUTPUT_FILE" ]; then
+            echo "❌ No se encontró ningún spec file existente"
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # GraphQL Schema Export
+      # -----------------------------------------------------------------------
+      - name: "📋 Exportar GraphQL Schema"
+        id: gen_graphql
+        if: env.API_TYPE == 'graphql' || steps.detect_framework.outputs.framework == 'graphql-js'
+        run: |
+          OUTPUT_FILE="schema.graphql"
+
+          # Instalar herramientas de GraphQL
+          npm install --no-save graphql get-graphql-schema 2>/dev/null || true
+
+          # Intentar extraer desde el código local
+          if [ -f "src/schema.ts" ] || [ -f "src/schema.js" ]; then
+            # Exportar schema desde código
+            cat > /tmp/export-graphql.js << 'SCRIPT'
+const { printSchema } = require('graphql');
+const fs = require('fs');
+let schema;
+try {
+  schema = require('./src/schema').schema || require('./src/schema').default;
+} catch(e) {
+  try { schema = require('./schema').schema || require('./schema').default; }
+  catch(e2) { console.error('No se pudo importar el schema GraphQL'); process.exit(1); }
+}
+fs.writeFileSync('schema.graphql', printSchema(schema));
+console.log('✅ GraphQL schema exportado: schema.graphql');
+SCRIPT
+            node /tmp/export-graphql.js
+          elif [ -f "schema.graphql" ]; then
+            echo "✅ Usando schema.graphql existente"
+          else
+            echo "⚠️ No se encontró el schema GraphQL local"
+          fi
+
+          echo "spec_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # gRPC / Protobuf → HTML con protoc-gen-doc
+      # -----------------------------------------------------------------------
+      - name: "📋 Generar docs desde Protobuf"
+        id: gen_grpc
+        if: env.API_TYPE == 'grpc' || steps.detect_framework.outputs.framework == 'grpc'
+        run: |
+          # Instalar protoc-gen-doc via Docker
+          PROTO_FILES=$(find . -name "*.proto" -not -path "*/vendor/*" | tr '\n' ' ')
+
+          if [ -z "$PROTO_FILES" ]; then
+            echo "❌ No se encontraron archivos .proto"
+            exit 1
+          fi
+
+          mkdir -p proto-docs
+
+          docker run --rm \
+            -v "$(pwd):/out" \
+            -v "$(pwd):/protos" \
+            pseudomuto/protoc-gen-doc \
+            --doc_opt=html,index.html \
+            $PROTO_FILES 2>/dev/null || \
+          echo "⚠️ protoc-gen-doc requiere Docker. Instala Docker en el runner."
+
+          echo "spec_file=proto-docs/index.html" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Validar el spec OpenAPI con swagger-parser o spectral
+      # -----------------------------------------------------------------------
+      - name: "✅ Validar especificación OpenAPI"
+        id: validate
+        if: env.API_TYPE == 'openapi'
+        run: |
+          SPEC_FILE="${{ steps.gen_express.outputs.spec_file || steps.gen_nestjs.outputs.spec_file || steps.gen_fastapi.outputs.spec_file || steps.gen_django.outputs.spec_file || steps.gen_springdoc.outputs.spec_file || steps.gen_spec_file.outputs.spec_file || 'api-spec.yaml' }}"
+
+          if [ ! -f "$SPEC_FILE" ]; then
+            echo "⚠️ No se encontró spec file para validar: $SPEC_FILE"
+            exit 0
+          fi
+
+          echo "🔍 Validando: $SPEC_FILE"
+
+          # Usar @stoplight/spectral para validación avanzada
+          npm install --global @stoplight/spectral-cli 2>/dev/null || true
+
+          if command -v spectral > /dev/null 2>&1; then
+            # Validar contra las reglas de OAS (OpenAPI Specification)
+            spectral lint "$SPEC_FILE" \
+              --ruleset "@stoplight/spectral-openapi" \
+              --format stylish \
+              2>&1 || echo "⚠️ Spectral encontró advertencias (no bloquea el deploy)"
+          else
+            # Fallback: validación básica con swagger-parser
+            npm install --no-save @apidevtools/swagger-parser 2>/dev/null
+            node -e "
+              const SwaggerParser = require('@apidevtools/swagger-parser');
+              SwaggerParser.validate('$SPEC_FILE')
+                .then(() => console.log('✅ Spec OpenAPI válido'))
+                .catch(e => { console.error('❌ Error de validación:', e.message); process.exit(1); })
+            " 2>/dev/null || echo "⚠️ Validación no disponible"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Determinar el archivo de spec generado
+      # -----------------------------------------------------------------------
+      - name: "📌 Resolver archivo de spec"
+        id: generate
+        run: |
+          SPEC_FILE="${{ steps.gen_express.outputs.spec_file || steps.gen_nestjs.outputs.spec_file || steps.gen_fastapi.outputs.spec_file || steps.gen_django.outputs.spec_file || steps.gen_springdoc.outputs.spec_file || steps.gen_spec_file.outputs.spec_file || steps.gen_graphql.outputs.spec_file || 'api-spec.yaml' }}"
+
+          if [ ! -f "$SPEC_FILE" ]; then
+            echo "❌ No se generó ningún archivo de spec"
+            ls -la
+            exit 1
+          fi
+
+          echo "✅ Spec file: $SPEC_FILE"
+          echo "spec_file=$SPEC_FILE" >> "$GITHUB_OUTPUT"
+
+          # Guardar el spec como artefacto independientemente del deploy
+          mkdir -p _api_spec
+          cp "$SPEC_FILE" _api_spec/
+
+      # -----------------------------------------------------------------------
+      # Guardar el spec como artefacto de GitHub (siempre)
+      # -----------------------------------------------------------------------
+      - name: "💾 Guardar spec como artefacto"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "api-spec-${{ github.sha }}"
+          path: _api_spec/
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # Generar portal interactivo (Redoc o Swagger UI)
+      # -----------------------------------------------------------------------
+      - name: "🎨 Generar portal Redoc"
+        id: portal_redoc
+        if: github.event.inputs.generate_portal != 'false' && env.PORTAL_TYPE == 'redoc'
+        run: |
+          SPEC_FILE="${{ steps.generate.outputs.spec_file }}"
+          mkdir -p _api_portal
+
+          npm install --global @redocly/cli 2>/dev/null || true
+
+          if command -v redocly > /dev/null 2>&1; then
+            # Generar HTML estático con Redoc
+            redocly build-docs "$SPEC_FILE" \
+              --output _api_portal/index.html \
+              --title "${{ vars.API_TITLE || github.event.repository.name }} API Docs" \
+              2>/dev/null
+            echo "✅ Portal Redoc generado"
+          else
+            # Fallback: generar HTML manualmente con CDN
+            API_TITLE="${{ vars.API_TITLE || github.event.repository.name }}"
+            SPEC_FILENAME=$(basename "$SPEC_FILE")
+            cp "$SPEC_FILE" "_api_portal/$SPEC_FILENAME"
+
+            cat > _api_portal/index.html << HTMLEOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>${API_TITLE} — API Documentation</title>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
+            <style>body { margin: 0; padding: 0; }</style>
+          </head>
+          <body>
+            <redoc spec-url='${SPEC_FILENAME}'></redoc>
+            <script src="https://cdn.jsdelivr.net/npm/redoc/bundles/redoc.standalone.js"></script>
+          </body>
+          </html>
+          HTMLEOF
+            echo "✅ Portal Redoc (CDN) generado"
+          fi
+
+      - name: "🎨 Generar portal Swagger UI"
+        id: portal_swagger
+        if: github.event.inputs.generate_portal != 'false' && env.PORTAL_TYPE == 'swagger-ui'
+        run: |
+          SPEC_FILE="${{ steps.generate.outputs.spec_file }}"
+          mkdir -p _api_portal
+
+          # Descargar Swagger UI dist
+          SWAGGER_UI_VERSION="5.17.14"
+          curl -sL "https://github.com/swagger-api/swagger-ui/archive/refs/tags/v${SWAGGER_UI_VERSION}.tar.gz" | \
+            tar xz -C /tmp
+
+          cp -r "/tmp/swagger-ui-${SWAGGER_UI_VERSION}/dist/." _api_portal/
+          cp "$SPEC_FILE" "_api_portal/$(basename $SPEC_FILE)"
+
+          # Actualizar la URL del spec en swagger-initializer.js
+          SPEC_FILENAME=$(basename "$SPEC_FILE")
+          sed -i "s|https://petstore.swagger.io/v2/swagger.json|./$SPEC_FILENAME|g" \
+            _api_portal/swagger-initializer.js
+
+          echo "✅ Portal Swagger UI generado"
+
+      # -----------------------------------------------------------------------
+      # Si no se generó portal, usar el spec directamente como "portal"
+      # -----------------------------------------------------------------------
+      - name: "📂 Preparar directorio de publicación"
+        id: prepare_publish
+        run: |
+          # Determinar qué publicar
+          if [ -d "_api_portal" ] && [ "$(ls -A _api_portal)" ]; then
+            PUBLISH_DIR="_api_portal"
+          else
+            # Sin portal: publicar solo el spec file
+            mkdir -p _api_portal
+            SPEC_FILE="${{ steps.generate.outputs.spec_file }}"
+            cp "$SPEC_FILE" "_api_portal/"
+
+            # Crear index.html mínimo que muestre el spec
+            cat > _api_portal/index.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>API Spec</title></head>
+          <body>
+            <h1>API Specification</h1>
+            <p>Download the spec: <a href="api-spec.yaml">api-spec.yaml</a></p>
+          </body>
+          </html>
+          HTMLEOF
+            PUBLISH_DIR="_api_portal"
+          fi
+
+          echo "publish_dir=$PUBLISH_DIR" >> "$GITHUB_OUTPUT"
+          echo "📂 Directorio de publicación: $PUBLISH_DIR"
+          ls -la "$PUBLISH_DIR/"
+
+      # -----------------------------------------------------------------------
+      # Skip deploy si target es artifact-only
+      # -----------------------------------------------------------------------
+
+      - name: "📤 Upload para GitHub Pages"
+        if: env.DEPLOY_TARGET == 'github_pages'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.prepare_publish.outputs.publish_dir }}
+
+      - name: "🚀 Deploy → GitHub Pages"
+        id: deploy_pages
+        if: env.DEPLOY_TARGET == 'github_pages'
+        uses: actions/deploy-pages@v4
+
+      - name: "🌿 Deploy → Netlify"
+        if: env.DEPLOY_TARGET == 'netlify'
+        uses: nwtgck/actions-netlify@v3
+        with:
+          publish-dir: ${{ steps.prepare_publish.outputs.publish_dir }}
+          production-deploy: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          deploy-message: "API Docs update — ${{ github.sha }}"
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+
+      # -----------------------------------------------------------------------
+      # Job Summary
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          SPEC_FILE="${{ steps.generate.outputs.spec_file || 'N/A' }}"
+          DOCS_URL="${{ steps.deploy_pages.outputs.page_url || 'N/A' }}"
+          FRAMEWORK="${{ steps.detect_framework.outputs.framework || 'N/A' }}"
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 🔌 API Documentation
+
+          | Campo | Valor |
+          |-------|-------|
+          | Tipo de API | \`${{ env.API_TYPE }}\` |
+          | Framework | \`$FRAMEWORK\` |
+          | Spec file | \`$SPEC_FILE\` |
+          | Portal | \`${{ env.PORTAL_TYPE }}\` |
+          | Destino | \`${{ env.DEPLOY_TARGET }}\` |
+          | Estado | $( [ "${{ job.status }}" = "success" ] && echo "✅ Publicado" || echo "❌ Error" ) |
+
+          $( [ "$DOCS_URL" != "N/A" ] && echo "## 🔗 URL del portal de API" || echo "" )
+          $( [ "$DOCS_URL" != "N/A" ] && echo "[$DOCS_URL]($DOCS_URL)" || echo "" )
+
+          ## 📦 Artefacto
+          El spec generado está disponible como artefacto: \`api-spec-${{ github.sha }}\`
+          EOF

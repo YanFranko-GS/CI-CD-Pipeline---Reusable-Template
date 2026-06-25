@@ -1,0 +1,722 @@
+# =============================================================================
+# .github/workflows/deploy-docs.yml
+# Generación y publicación automática de documentación estática
+# Módulo 8 de la Suite DevOps
+# =============================================================================
+#
+# HERRAMIENTAS SOPORTADAS:
+#   ✅ Docusaurus   → docs/docusaurus.config.js | Node.js
+#   ✅ MkDocs       → mkdocs.yml                | Python
+#   ✅ Sphinx       → docs/conf.py              | Python
+#   ✅ Javadoc      → pom.xml / build.gradle    | Java
+#   ✅ VitePress    → docs/.vitepress/config.ts | Node.js
+#   ✅ Astro Starlight → astro.config.mjs       | Node.js
+#
+# DESTINOS DE DESPLIEGUE:
+#   ✅ GitHub Pages (gratuito, integrado)
+#   ✅ Netlify (previews automáticos por PR)
+#   ✅ Vercel (edge network, previews automáticos)
+#
+# PREREQUISITOS:
+#   GitHub Pages:
+#     Settings → Pages → Source: "GitHub Actions"
+#   Netlify:
+#     secrets.NETLIFY_AUTH_TOKEN → netlify.com → User Settings → Applications
+#     secrets.NETLIFY_SITE_ID   → Site Settings → General → Site ID
+#   Vercel:
+#     secrets.VERCEL_TOKEN       → vercel.com → Settings → Tokens
+#     secrets.VERCEL_ORG_ID      → vercel.com → Settings → General
+#     secrets.VERCEL_PROJECT_ID  → vercel.com → Project → Settings
+#
+# VARIABLES DE REPOSITORIO OPCIONALES:
+#   vars.DOCS_TOOL         → Herramienta por defecto (docusaurus, mkdocs, etc.)
+#   vars.DOCS_DEPLOY_TARGET → Destino por defecto (github_pages, netlify, vercel)
+#   vars.DOCS_DIR          → Directorio de fuentes (default: docs)
+#   vars.DOCS_BUILD_DIR    → Directorio de output (default: build o _build/html)
+#   vars.CUSTOM_DOMAIN     → Dominio personalizado para GitHub Pages
+#   vars.SLACK_NOTIFY_DOCS → "true" para notificar en Slack tras deploy
+# =============================================================================
+
+name: "📚 Deploy Documentation"
+
+on:
+  # Ejecutar cuando cambian archivos de documentación o código
+  push:
+    branches:
+      - main
+      # Añadir otras ramas si también publicas documentación desde develop:
+      # - develop
+    paths:
+      - "docs/**"            # Fuentes de documentación
+      - "src/**"             # Código (para doc extraída de anotaciones)
+      - "api/**"             # Especificaciones de API
+      - "swagger.yaml"
+      - "openapi.json"
+      - "openapi.yaml"
+      - "mkdocs.yml"         # Configuración de MkDocs
+      - "docusaurus.config.js"
+      - "docusaurus.config.ts"
+      - "astro.config.mjs"
+      - "*.md"               # READMEs en la raíz que pueden ser parte de la doc
+      - ".github/workflows/deploy-docs.yml"  # El propio workflow
+    paths-ignore:
+      - "docs/CHANGELOG.md"  # El changelog se gestiona en otro workflow
+      - "**/*.test.*"        # Tests no afectan la documentación
+
+  # Regeneración y publicación manual bajo demanda
+  workflow_dispatch:
+    inputs:
+      doc_tool:
+        description: |
+          Herramienta generadora de documentación:
+          • auto-detect → Detectar automáticamente (recomendado)
+          • docusaurus  → Docusaurus 3.x (React, MDX)
+          • mkdocs      → MkDocs + Material theme (Markdown)
+          • sphinx      → Sphinx (reStructuredText/Markdown)
+          • javadoc     → Javadoc / KDoc para proyectos JVM
+          • vitepress   → VitePress (Vue, Markdown)
+          • astro       → Astro Starlight
+        required: false
+        default: "auto-detect"
+        type: choice
+        options:
+          - auto-detect
+          - docusaurus
+          - mkdocs
+          - sphinx
+          - javadoc
+          - vitepress
+          - astro
+
+      deploy_target:
+        description: "Destino de publicación de la documentación"
+        required: false
+        default: "github_pages"
+        type: choice
+        options:
+          - github_pages
+          - netlify
+          - vercel
+
+      node_version:
+        description: "Versión de Node.js (para Docusaurus, VitePress, Astro)"
+        required: false
+        default: "20"
+        type: string
+
+      python_version:
+        description: "Versión de Python (para MkDocs, Sphinx)"
+        required: false
+        default: "3.12"
+        type: string
+
+      java_version:
+        description: "Versión de Java (para Javadoc)"
+        required: false
+        default: "21"
+        type: string
+
+      extra_build_args:
+        description: "Argumentos adicionales para el comando de build"
+        required: false
+        type: string
+
+  # Invocado como parte del pipeline de release
+  workflow_call:
+    inputs:
+      doc_tool:
+        required: false
+        default: "auto-detect"
+        type: string
+      deploy_target:
+        required: false
+        default: "github_pages"
+        type: string
+    secrets:
+      NETLIFY_AUTH_TOKEN:
+        required: false
+      NETLIFY_SITE_ID:
+        required: false
+      VERCEL_TOKEN:
+        required: false
+      VERCEL_ORG_ID:
+        required: false
+      VERCEL_PROJECT_ID:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+# =============================================================================
+# PERMISOS — Los mínimos necesarios según el destino
+# =============================================================================
+permissions:
+  contents: read   # Leer el código y la documentación
+  pages: write     # Publicar en GitHub Pages
+  id-token: write  # OIDC para GitHub Pages (requerido por actions/deploy-pages)
+  pull-requests: write  # Comentar en PRs con la URL de preview (Netlify/Vercel)
+
+# =============================================================================
+# CONCURRENCIA
+# Si hay varios pushes seguidos, construir solo el más reciente
+# El cancel-in-progress: true es seguro para builds de documentación
+# =============================================================================
+concurrency:
+  group: deploy-docs-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================================
+# VARIABLES GLOBALES
+# =============================================================================
+env:
+  # Herramienta a usar (input > variable de repo > auto-detect)
+  DOC_TOOL_INPUT: ${{ github.event.inputs.doc_tool || inputs.doc_tool || vars.DOCS_TOOL || 'auto-detect' }}
+  # Destino de deploy
+  DEPLOY_TARGET: ${{ github.event.inputs.deploy_target || inputs.deploy_target || vars.DOCS_DEPLOY_TARGET || 'github_pages' }}
+  # Versiones de runtime
+  NODE_VERSION: ${{ github.event.inputs.node_version || vars.NODE_VERSION || '20' }}
+  PYTHON_VERSION: ${{ github.event.inputs.python_version || vars.PYTHON_VERSION || '3.12' }}
+  JAVA_VERSION: ${{ github.event.inputs.java_version || vars.JAVA_VERSION || '21' }}
+  # Directorio de documentación fuente
+  DOCS_DIR: ${{ vars.DOCS_DIR || 'docs' }}
+  # Directorio de output de la build
+  # Se sobreescribe según la herramienta detectada
+  BUILD_DIR: ""
+
+jobs:
+  # ===========================================================================
+  # JOB ÚNICO: Build y Deploy
+  # Combinar en un job permite pasar el directorio de build entre steps
+  # sin necesidad de artefactos intermedios
+  # ===========================================================================
+  build-and-deploy:
+    name: "📚 Build & Deploy Docs"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Exponer la URL del sitio publicado en la UI de GitHub Actions
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy_pages.outputs.page_url || steps.deploy_netlify.outputs.deploy-url || steps.deploy_vercel.outputs.preview-url }}
+
+    outputs:
+      docs_url: ${{ steps.deploy_pages.outputs.page_url || steps.deploy_netlify.outputs.deploy-url }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # PASO 1: Checkout con historial completo
+      # fetch-depth: 0 es necesario para:
+      #   - Docusaurus: puede mostrar "Last updated" usando git log
+      #   - MkDocs: el plugin git-revision-date-localized lo requiere
+      #   - Sphinx: idem para extensiones de historial
+      # -----------------------------------------------------------------------
+      - name: "📥 Checkout (historial completo)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Si la documentación está en un submódulo:
+          # submodules: recursive
+
+      # -----------------------------------------------------------------------
+      # PASO 2: Detectar la herramienta de documentación automáticamente
+      # El script examina los archivos de configuración en el repositorio
+      # para determinar qué herramienta está configurada
+      # -----------------------------------------------------------------------
+      - name: "🔍 Detectar herramienta de documentación"
+        id: detect
+        run: |
+          TOOL="${{ env.DOC_TOOL_INPUT }}"
+          BUILD_DIR=""
+
+          if [ "$TOOL" != "auto-detect" ]; then
+            echo "🛠️ Herramienta especificada: $TOOL"
+          else
+            echo "🔍 Auto-detectando herramienta de documentación..."
+
+            # Orden de detección: verificar archivos de configuración característicos
+            if [ -f "docusaurus.config.js" ] || [ -f "docusaurus.config.ts" ]; then
+              TOOL="docusaurus"
+              echo "  ✅ Detectado: Docusaurus (docusaurus.config.*)"
+
+            elif [ -f "astro.config.mjs" ] || [ -f "astro.config.ts" ]; then
+              # Verificar que sea Starlight y no solo Astro general
+              if grep -q "starlight" astro.config.mjs 2>/dev/null || \
+                 grep -q "@astrojs/starlight" package.json 2>/dev/null; then
+                TOOL="astro"
+                echo "  ✅ Detectado: Astro Starlight"
+              else
+                TOOL="docusaurus"  # Fallback a Docusaurus si hay package.json con build
+                echo "  ⚠️ Astro detectado pero sin Starlight. Usando como Docusaurus-like."
+              fi
+
+            elif [ -f "docs/.vitepress/config.ts" ] || [ -f "docs/.vitepress/config.js" ]; then
+              TOOL="vitepress"
+              echo "  ✅ Detectado: VitePress (.vitepress/config.*)"
+
+            elif [ -f "mkdocs.yml" ] || [ -f "mkdocs.yaml" ]; then
+              TOOL="mkdocs"
+              echo "  ✅ Detectado: MkDocs (mkdocs.yml)"
+
+            elif [ -f "docs/conf.py" ] || [ -f "conf.py" ]; then
+              TOOL="sphinx"
+              echo "  ✅ Detectado: Sphinx (conf.py)"
+
+            elif [ -f "pom.xml" ] && grep -q "maven-javadoc-plugin" pom.xml 2>/dev/null; then
+              TOOL="javadoc"
+              echo "  ✅ Detectado: Javadoc (pom.xml con maven-javadoc-plugin)"
+
+            elif [ -f "build.gradle" ] && grep -q "javadoc" build.gradle 2>/dev/null; then
+              TOOL="javadoc"
+              echo "  ✅ Detectado: Javadoc (build.gradle)"
+
+            elif [ -f "package.json" ]; then
+              # Verificar el script de build en package.json
+              BUILD_SCRIPT=$(jq -r '.scripts.build // ""' package.json 2>/dev/null)
+              if echo "$BUILD_SCRIPT" | grep -qi "docusaurus\|docs"; then
+                TOOL="docusaurus"
+                echo "  ✅ Detectado: Docusaurus (via package.json scripts)"
+              else
+                echo "  ⚠️ package.json encontrado pero no es una herramienta de docs conocida"
+                TOOL="docusaurus"  # Intento genérico
+              fi
+
+            else
+              echo "❌ No se detectó ninguna herramienta de documentación conocida."
+              echo "   Archivos buscados:"
+              echo "   - docusaurus.config.js / .ts"
+              echo "   - astro.config.mjs (con Starlight)"
+              echo "   - docs/.vitepress/config.ts"
+              echo "   - mkdocs.yml"
+              echo "   - docs/conf.py (Sphinx)"
+              echo "   - pom.xml con maven-javadoc-plugin"
+              echo "   Especifica la herramienta via input 'doc_tool' o variable DOCS_TOOL"
+              exit 1
+            fi
+          fi
+
+          # Determinar el directorio de output según la herramienta
+          case "$TOOL" in
+            docusaurus) BUILD_DIR="${{ vars.DOCS_BUILD_DIR || 'build' }}" ;;
+            mkdocs)     BUILD_DIR="${{ vars.DOCS_BUILD_DIR || 'site' }}" ;;
+            sphinx)     BUILD_DIR="${{ vars.DOCS_BUILD_DIR || 'docs/_build/html' }}" ;;
+            javadoc)    BUILD_DIR="${{ vars.DOCS_BUILD_DIR || 'target/site/apidocs' }}" ;;
+            vitepress)  BUILD_DIR="${{ vars.DOCS_BUILD_DIR || 'docs/.vitepress/dist' }}" ;;
+            astro)      BUILD_DIR="${{ vars.DOCS_BUILD_DIR || 'dist' }}" ;;
+          esac
+
+          echo "doc_tool=$TOOL"     >> "$GITHUB_OUTPUT"
+          echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
+
+          echo "============================================"
+          echo "📚 Herramienta: $TOOL"
+          echo "📂 Directorio de output: $BUILD_DIR"
+          echo "🚀 Destino de deploy: ${{ env.DEPLOY_TARGET }}"
+          echo "============================================"
+
+      # =======================================================================
+      # SECCIÓN: DOCUSAURUS
+      # =======================================================================
+
+      - name: "⚙️ Setup Node.js (Docusaurus/VitePress/Astro)"
+        if: contains(fromJSON('["docusaurus","vitepress","astro"]'), steps.detect.outputs.doc_tool)
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # cache: usa el lockfile de la raíz o del subdirectorio docs/
+          cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            docs/package-lock.json
+
+      - name: "💾 Cache de node_modules"
+        if: contains(fromJSON('["docusaurus","vitepress","astro"]'), steps.detect.outputs.doc_tool)
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            docs/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-
+            ${{ runner.os }}-node-
+
+      - name: "📦 Instalar dependencias (Node)"
+        if: contains(fromJSON('["docusaurus","vitepress","astro"]'), steps.detect.outputs.doc_tool)
+        run: |
+          # Si el proyecto está en la raíz:
+          if [ -f "package.json" ]; then
+            npm ci --prefer-offline
+          fi
+
+          # Si Docusaurus está en una subcarpeta docs/:
+          if [ -f "docs/package.json" ]; then
+            cd docs && npm ci --prefer-offline
+          fi
+
+      - name: "🏗️ Build Docusaurus"
+        if: steps.detect.outputs.doc_tool == 'docusaurus'
+        run: |
+          EXTRA="${{ github.event.inputs.extra_build_args || '' }}"
+
+          # Detectar si Docusaurus está en raíz o en docs/
+          if [ -f "package.json" ] && grep -q "docusaurus" package.json; then
+            npm run build $EXTRA
+          elif [ -f "docs/package.json" ]; then
+            cd docs && npm run build $EXTRA
+          fi
+
+          echo "✅ Docusaurus build completado"
+          ls -la ${{ steps.detect.outputs.build_dir }}/ 2>/dev/null | head -20
+        env:
+          NODE_ENV: production
+          # URL base para despliegue en subdirectorio de GitHub Pages
+          # Si el site está en: https://org.github.io/repo-name/
+          # Docusaurus necesita saber el baseUrl: '/repo-name/'
+          # Configura esto en docusaurus.config.js con:
+          # baseUrl: process.env.BASE_URL || '/'
+          BASE_URL: ${{ vars.DOCS_BASE_URL || '/' }}
+
+      - name: "🏗️ Build VitePress"
+        if: steps.detect.outputs.doc_tool == 'vitepress'
+        run: |
+          EXTRA="${{ github.event.inputs.extra_build_args || '' }}"
+          npm run docs:build $EXTRA 2>/dev/null || npx vitepress build docs $EXTRA
+          echo "✅ VitePress build completado"
+
+      - name: "🏗️ Build Astro Starlight"
+        if: steps.detect.outputs.doc_tool == 'astro'
+        run: |
+          EXTRA="${{ github.event.inputs.extra_build_args || '' }}"
+          npm run build $EXTRA
+          echo "✅ Astro Starlight build completado"
+        env:
+          SITE: ${{ vars.DOCS_SITE_URL || '' }}
+
+      # =======================================================================
+      # SECCIÓN: MKDOCS
+      # =======================================================================
+
+      - name: "⚙️ Setup Python (MkDocs/Sphinx)"
+        if: contains(fromJSON('["mkdocs","sphinx"]'), steps.detect.outputs.doc_tool)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            docs/requirements.txt
+            requirements-docs.txt
+
+      - name: "📦 Instalar dependencias Python (MkDocs)"
+        if: steps.detect.outputs.doc_tool == 'mkdocs'
+        run: |
+          pip install --upgrade pip
+
+          # Usar requirements.txt específico de docs si existe
+          if [ -f "docs/requirements.txt" ]; then
+            pip install -r docs/requirements.txt
+          elif [ -f "requirements-docs.txt" ]; then
+            pip install -r requirements-docs.txt
+          elif [ -f "requirements.txt" ] && grep -q "mkdocs" requirements.txt; then
+            pip install -r requirements.txt
+          else
+            # Instalación por defecto con el tema más popular (Material)
+            pip install \
+              mkdocs \
+              mkdocs-material \
+              mkdocs-material-extensions \
+              pymdown-extensions \
+              mkdocs-git-revision-date-localized-plugin \
+              mkdocs-minify-plugin \
+              mkdocs-redirects
+            echo "ℹ️ Dependencias de MkDocs instaladas por defecto."
+            echo "   Para personalizar, crea docs/requirements.txt o requirements-docs.txt"
+          fi
+
+          mkdocs --version
+
+      - name: "🏗️ Build MkDocs"
+        if: steps.detect.outputs.doc_tool == 'mkdocs'
+        run: |
+          EXTRA="${{ github.event.inputs.extra_build_args || '' }}"
+          # --strict: tratar warnings como errores (recomendado para producción)
+          # --verbose: más información de diagnóstico
+          mkdocs build --strict $EXTRA
+          echo "✅ MkDocs build completado"
+          ls -la site/
+
+      # =======================================================================
+      # SECCIÓN: SPHINX
+      # =======================================================================
+
+      - name: "📦 Instalar dependencias Python (Sphinx)"
+        if: steps.detect.outputs.doc_tool == 'sphinx'
+        run: |
+          pip install --upgrade pip
+
+          # Instalar dependencias del proyecto (para autodoc que importa el código)
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
+
+          # Instalar herramientas de documentación
+          if [ -f "docs/requirements.txt" ]; then
+            pip install -r docs/requirements.txt
+          else
+            pip install \
+              sphinx \
+              sphinx-rtd-theme \
+              sphinx-autodoc-typehints \
+              myst-parser \
+              sphinx-copybutton \
+              sphinx-tabs
+            echo "ℹ️ Dependencias de Sphinx instaladas por defecto."
+          fi
+
+          sphinx-build --version
+
+      - name: "🏗️ Build Sphinx"
+        if: steps.detect.outputs.doc_tool == 'sphinx'
+        run: |
+          DOCS_DIR="${{ vars.DOCS_DIR || 'docs' }}"
+          EXTRA="${{ github.event.inputs.extra_build_args || '' }}"
+
+          # sphinx-build: construir HTML desde la carpeta de fuentes
+          # -W: convertir warnings en errores
+          # -n: nitpicky mode (reportar referencias rotas)
+          # -b html: builder HTML
+          sphinx-build \
+            -b html \
+            -W \
+            -n \
+            $EXTRA \
+            "$DOCS_DIR" \
+            "docs/_build/html"
+
+          echo "✅ Sphinx build completado"
+          ls -la docs/_build/html/
+
+      # =======================================================================
+      # SECCIÓN: JAVADOC
+      # =======================================================================
+
+      - name: "⚙️ Setup Java (Javadoc)"
+        if: steps.detect.outputs.doc_tool == 'javadoc'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: "temurin"
+          # Para Maven: cache: 'maven'
+          # Para Gradle: cache: 'gradle'
+          cache: ${{ hashFiles('pom.xml') != '' && 'maven' || 'gradle' }}
+
+      - name: "🏗️ Build Javadoc (Maven)"
+        if: steps.detect.outputs.doc_tool == 'javadoc' && hashFiles('pom.xml') != ''
+        run: |
+          mvn javadoc:javadoc \
+            --no-transfer-progress \
+            -q \
+            ${{ github.event.inputs.extra_build_args || '' }}
+
+          echo "✅ Javadoc Maven completado"
+          ls -la target/site/apidocs/
+
+      - name: "🏗️ Build Javadoc (Gradle)"
+        if: steps.detect.outputs.doc_tool == 'javadoc' && hashFiles('build.gradle') != ''
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          ./gradlew javadoc \
+            --no-daemon \
+            ${{ github.event.inputs.extra_build_args || '' }}
+
+          echo "✅ Javadoc Gradle completado"
+          # Javadoc de Gradle típicamente va a: build/docs/javadoc/
+          ls -la build/docs/javadoc/ 2>/dev/null || ls -la target/site/apidocs/ 2>/dev/null
+
+      # -----------------------------------------------------------------------
+      # Normalizar el directorio de build para Javadoc
+      # Gradle y Maven ponen el output en lugares distintos
+      # -----------------------------------------------------------------------
+      - name: "📁 Normalizar directorio de output Javadoc"
+        if: steps.detect.outputs.doc_tool == 'javadoc'
+        run: |
+          # Crear directorio de output normalizado
+          mkdir -p _javadoc_output
+
+          # Maven: target/site/apidocs/
+          if [ -d "target/site/apidocs" ]; then
+            cp -r target/site/apidocs/. _javadoc_output/
+          # Gradle: build/docs/javadoc/
+          elif [ -d "build/docs/javadoc" ]; then
+            cp -r build/docs/javadoc/. _javadoc_output/
+          else
+            echo "❌ No se encontró el output de Javadoc"
+            exit 1
+          fi
+
+          echo "✅ Output Javadoc copiado a _javadoc_output/"
+          echo "build_dir=_javadoc_output" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # PASO FINAL DE BUILD: Verificar que el directorio de output existe
+      # -----------------------------------------------------------------------
+      - name: "✅ Verificar output de la build"
+        id: verify
+        run: |
+          BUILD_DIR="${{ steps.detect.outputs.build_dir }}"
+
+          # Para Javadoc normalizado, el build dir cambia
+          if [ -n "${{ env.build_dir }}" ]; then
+            BUILD_DIR="${{ env.build_dir }}"
+          fi
+
+          echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
+
+          if [ ! -d "$BUILD_DIR" ]; then
+            echo "❌ Directorio de build no encontrado: $BUILD_DIR"
+            echo "   Herramienta: ${{ steps.detect.outputs.doc_tool }}"
+            echo ""
+            echo "Contenido del directorio actual:"
+            ls -la
+            exit 1
+          fi
+
+          FILE_COUNT=$(find "$BUILD_DIR" -type f | wc -l)
+          TOTAL_SIZE=$(du -sh "$BUILD_DIR" | cut -f1)
+
+          echo "✅ Build verificado:"
+          echo "   📂 Directorio: $BUILD_DIR"
+          echo "   📄 Archivos:   $FILE_COUNT"
+          echo "   💾 Tamaño:     $TOTAL_SIZE"
+
+          # Mostrar los primeros archivos para diagnóstico
+          echo ""
+          echo "Primeros archivos generados:"
+          find "$BUILD_DIR" -type f | head -15
+
+      # =======================================================================
+      # DESPLIEGUE: GITHUB PAGES
+      # =======================================================================
+
+      - name: "📤 Preparar artefacto para GitHub Pages"
+        if: env.DEPLOY_TARGET == 'github_pages'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # El directorio de build normalizado
+          path: ${{ steps.verify.outputs.build_dir }}
+
+      - name: "🚀 Deploy → GitHub Pages"
+        id: deploy_pages
+        if: env.DEPLOY_TARGET == 'github_pages'
+        uses: actions/deploy-pages@v4
+        # Esta action usa el artefacto subido en el paso anterior
+        # Requiere:
+        #   1. Settings → Pages → Source: "GitHub Actions" (no "Deploy from branch")
+        #   2. Permisos: pages: write, id-token: write (ya configurados arriba)
+
+      - name: "✅ URL de la documentación publicada (GitHub Pages)"
+        if: env.DEPLOY_TARGET == 'github_pages' && steps.deploy_pages.outcome == 'success'
+        run: |
+          echo "📚 Documentación publicada en:"
+          echo "   ${{ steps.deploy_pages.outputs.page_url }}"
+
+      # =======================================================================
+      # DESPLIEGUE: NETLIFY
+      # Ventaja: preview URLs automáticas, edge network, formularios integrados
+      # =======================================================================
+
+      - name: "🌿 Deploy → Netlify"
+        id: deploy_netlify
+        if: env.DEPLOY_TARGET == 'netlify'
+        uses: nwtgck/actions-netlify@v3
+        with:
+          publish-dir: ${{ steps.verify.outputs.build_dir }}
+          # production-deploy: true despliega a la URL principal del sitio
+          # false = deploy de preview (útil para PRs)
+          production-deploy: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          deploy-message: "Deploy from GitHub Actions — ${{ github.sha }}"
+          # Comentar en PRs con la URL de preview
+          enable-pull-request-comment: true
+          enable-commit-comment: true
+          # Opciones avanzadas de Netlify:
+          # netlify-config-path: netlify.toml
+          # functions-dir: netlify/functions
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        # Si Netlify falla, no bloquear el workflow (la documentación es importante pero no crítica)
+        continue-on-error: false
+
+      # =======================================================================
+      # DESPLIEGUE: VERCEL
+      # Ventaja: edge network global, previews instantáneos, integración Git nativa
+      # =======================================================================
+
+      - name: "▲ Deploy → Vercel"
+        id: deploy_vercel
+        if: env.DEPLOY_TARGET == 'vercel'
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          # --prod: deploy a la URL de producción (sin --prod = preview)
+          vercel-args: ${{ github.ref == 'refs/heads/main' && '--prod' || '' }}
+          working-directory: ${{ steps.verify.outputs.build_dir }}
+          # alias-domains: mi-docs.vercel.app  # Alias opcionales
+
+      # -----------------------------------------------------------------------
+      # NOTIFICACIÓN: Slack con la URL de la documentación publicada
+      # -----------------------------------------------------------------------
+      - name: "🔔 Notificar deploy exitoso a Slack"
+        if: |
+          success() &&
+          secrets.SLACK_WEBHOOK_URL != '' &&
+          (vars.SLACK_NOTIFY_DOCS == 'true' || github.event_name == 'workflow_dispatch')
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "📚 Documentación actualizada — ${{ github.repository }}",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "Herramienta", "value": "${{ steps.detect.outputs.doc_tool }}", "short": true},
+                  {"title": "Destino", "value": "${{ env.DEPLOY_TARGET }}", "short": true},
+                  {"title": "Rama", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Commit", "value": "${{ github.sha }}", "short": true},
+                  {"title": "URL", "value": "${{ steps.deploy_pages.outputs.page_url || steps.deploy_netlify.outputs.deploy-url || steps.deploy_vercel.outputs.preview-url || 'Ver workflow' }}", "short": false}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # -----------------------------------------------------------------------
+      # JOB SUMMARY
+      # -----------------------------------------------------------------------
+      - name: "📊 Job Summary"
+        if: always()
+        run: |
+          DOC_TOOL="${{ steps.detect.outputs.doc_tool || 'desconocido' }}"
+          BUILD_DIR="${{ steps.verify.outputs.build_dir || 'N/A' }}"
+          DEPLOY_URL="${{ steps.deploy_pages.outputs.page_url || steps.deploy_netlify.outputs.deploy-url || steps.deploy_vercel.outputs.preview-url || 'N/A' }}"
+          STATUS="${{ job.status }}"
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 📚 Deploy Documentation
+
+          | Campo | Valor |
+          |-------|-------|
+          | Herramienta | \`$DOC_TOOL\` |
+          | Destino | \`${{ env.DEPLOY_TARGET }}\` |
+          | Directorio build | \`$BUILD_DIR\` |
+          | Rama | \`${{ github.ref_name }}\` |
+          | Commit | \`${{ github.sha }}\` |
+          | Estado | $( [ "$STATUS" = "success" ] && echo "✅ Publicado" || echo "❌ Error" ) |
+
+          $( [ "$DEPLOY_URL" != "N/A" ] && echo "## 🔗 URL de la documentación" || echo "" )
+          $( [ "$DEPLOY_URL" != "N/A" ] && echo "[$DEPLOY_URL]($DEPLOY_URL)" || echo "" )
+          EOF
